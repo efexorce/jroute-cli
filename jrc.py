@@ -199,7 +199,7 @@ def _print_console_header(
         f"{cyan}│{reset} {bold}⚡ Jev Router Konsolu (jrc){reset} {dim}(Ollaya: {decision_model}){reset}\n"
         f"{cyan}│{reset} 📂 {bold}Dizin :{reset} {cwd} {dim}[{stack}]{reset}\n"
         f"{cyan}│{reset} 🎯 {bold}Hedef :{reset} {tool_str}   ⚙️  {bold}Mod :{reset} {' · '.join(modes)}\n"
-        f"{cyan}│{reset} 💡 {dim}Komut : /claude · /agy · /auto · /d (test) · /p (print) · /m (çok satır) · /help · q{reset}\n"
+        f"{cyan}│{reset} 💡 {dim}Komut : /claude · /agy · /auto · /d (test) · /p (print) · /y · /m (çok satır) · /help · q{reset}\n"
         f"{cyan}╰──────────────────────────────────────────────────────────────────────╯{reset}"
     )
 
@@ -525,7 +525,15 @@ def main() -> int:
         "--yes",
         dest="skip_permissions",
         action="store_true",
-        help="--dangerously-skip-permissions bayrağını ekle",
+        default=True,
+        help="--dangerously-skip-permissions bayrağını ekle (varsayılan: açık)",
+    )
+    parser.add_argument(
+        "--no-yes",
+        "--no-y",
+        dest="skip_permissions",
+        action="store_false",
+        help="İzin atlama modunu devre dışı bırak",
     )
     parser.add_argument(
         "--cwd",

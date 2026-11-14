@@ -64,10 +64,10 @@ jrc
 ╭──────────────────────────────────────────────────────────────────────╮
 │ ⚡ Jev Router Konsolu (jrc) (Ollaya: largha)
 │ 📂 Dizin : /path/to/workspace [python, git-repo]
-│ 🎯 Hedef : otomatik (claude / agy)   ⚙️  Mod : interaktif
-│ 💡 Komut : /claude · /agy · /auto · /d (test) · /p (print) · /m (çok satır) · /help · q
+│ 🎯 Hedef : otomatik (claude / agy)   ⚙️  Mod : interaktif · skip-perms (-y)
+│ 💡 Komut : /claude · /agy · /auto · /d (test) · /p (print) · /y · /m (çok satır) · /help · q
 ╰──────────────────────────────────────────────────────────────────────╯
-jrc [auto] ❯ 
+jrc [auto·yes] ❯ 
 ```
 
 #### Console Commands & Prefixes
@@ -76,7 +76,7 @@ jrc [auto] ❯
 - `!p <prompt>` / `/p`: One-shot print mode (`-p`) — runs the agent in non-interactive print mode and returns to the `jrc` prompt.
 - `@claude <prompt>` / `@agy <prompt>`: Forces `claude` or `agy` for a single message while letting Jev pick the optimal sub-model and effort.
 - `/claude`, `/agy`, `/auto`: Pins the target CLI tool for the session or resets to automatic routing.
-- `/y`: Toggles `--dangerously-skip-permissions`.
+- `/y` / `/yes`: Toggles `--dangerously-skip-permissions` (enabled by default).
 - `/m` (or trailing `\`): Multi-line prompt input mode.
 - `/cd <dir>`: Changes the active workspace directory inside the console.
 - `/models`: Lists all available routing profiles and criteria.
