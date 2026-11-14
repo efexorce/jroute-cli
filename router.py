@@ -193,16 +193,53 @@ def analyze_task_with_jev(
     ensure_ollaya_running(base_url)
     ws = collect_workspace_context(cwd)
 
-    state = {
-        "task": task,
-        "workspace": ws,
-    }
-
     route_criteria = {k: v["criteria"] for k, v in ROUTE_PROFILES.items()}
 
     t0 = time.perf_counter()
     with TypeSafeClient(base_url=base_url, api_key=api_key) as client:
-        response = client.system_one(
+        # largha'nın bağlamı çok dar: sorular + kriterler bütçenin çoğunu kullanıyor.
+        # Önce kompakt state ile dene; 422 "dropped to fit the context" gelirse daha da kısalt.
+        last_exc: Exception | None = None
+        for task_limit, with_ws in STATE_BUDGETS:
+            state = build_decision_state(task, ws, task_limit, with_ws)
+            try:
+                response = _ask_jev(client, decision_model, state, route_criteria)
+                break
+            except Exception as exc:  # TypeSafeAPIError
+                if "dropped to fit the context" not in str(exc):
+                    raise
+                last_exc = exc
+        else:
+            raise last_exc  # type: ignore[misc]
+    elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+    return _build_decision(task, forced_tool, response, elapsed_ms)
+
+
+# (görev karakter limiti, workspace özeti eklensin mi) — sırayla denenir
+STATE_BUDGETS: list[tuple[int, bool]] = [(700, True), (400, False), (150, False)]
+
+
+def _clip(text: str, limit: int) -> str:
+    """Uzun metni baş + son kısmı koruyarak kırpar."""
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    head = int(limit * 0.7)
+    tail = limit - head - 3
+    return text[:head] + " … " + text[-tail:]
+
+
+def build_decision_state(task: str, ws: dict[str, Any], task_limit: int, with_ws: bool) -> dict[str, Any]:
+    """Karar modeline gidecek minimal state (dosya listesi / eski görevler gönderilmez)."""
+    state: dict[str, Any] = {"task": _clip(task, task_limit)}
+    if with_ws:
+        state["project"] = ws.get("project_name", "")
+        state["stack"] = ws.get("stack_markers", [])
+    return state
+
+
+def _ask_jev(client: Any, decision_model: str, state: dict[str, Any], route_criteria: dict[str, str]) -> Any:
+    return client.system_one(
             model=decision_model,
             state=state,
             questions={
@@ -241,8 +278,9 @@ def analyze_task_with_jev(
                 ),
             },
         )
-    elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
 
+
+def _build_decision(task: str, forced_tool: str | None, response: Any, elapsed_ms: float) -> dict[str, Any]:
     route_ans = response.choices["route"]
     tool_ans = response.choices["tool"]
     comp_ans = response.scores["complexity"]
