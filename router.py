@@ -23,6 +23,14 @@ from typing import Any
 
 from typesafe_sdk import Choice, Noul, Score, TypeSafeClient
 
+# Claude'a emrin JEV router'dan geldiğini bildiren bağlam (ayrıntı: ~/.claude/CLAUDE.md "JEV" bölümü).
+JEV_SYSTEM_PROMPT = (
+    "Bu emir JEV router'dan (jroute/jrc) geldi; kullanıcı Mustafa'nın JEV iş akışıdır. "
+    "/home/efe çöplük değil, JEV klasörüdür; bu tür işlemlerde kullanılır. "
+    "İzinsiz taşıma/silme/temizlik yapma. Dizin haritası ve kurallar için ~/.claude/CLAUDE.md içindeki JEV bölümüne bak."
+)
+os.environ["JEV_ORIGIN"] = "1"  # exec/subprocess ile çocuk sürece geçer
+
 DEFAULT_BASE_URL = os.environ.get("TYPESAFE_BASE_URL", "http://127.0.0.1:11435")
 DEFAULT_API_KEY = os.environ.get("TYPESAFE_API_KEY", "local")
 DEFAULT_DECISION_MODEL = os.environ.get("TYPESAFE_DEFAULT_MODEL", "largha")
@@ -325,7 +333,8 @@ def build_cli_command(
     extra = extra_args or []
 
     if tool == "claude":
-        cmd = ["claude", "--model", model, "--effort", effort]
+        cmd = ["claude", "--model", model, "--effort", effort,
+               "--append-system-prompt", JEV_SYSTEM_PROMPT]
         if skip_permissions:
             cmd.append("--dangerously-skip-permissions")
         if print_mode:
@@ -364,7 +373,7 @@ def print_banner(decision: dict[str, Any], cmd: list[str]) -> None:
         f"karmaşıklık={m['complexity_level']} ({m['complexity_score']}) | "
         f"kritiklik={m['critical_probability']}\n"
         f"  └─ Komut        : {dim}{' '.join(
-            [repr(a) if ' ' in a else a for a in cmd[:-1]] + [repr(cmd[-1][:60] + ('…' if len(cmd[-1]) > 60 else ''))]
+            [repr(a[:60] + ('…' if len(a) > 60 else '')) if ' ' in a else a for a in cmd]
         )}{reset}",
         file=sys.stderr,
     )

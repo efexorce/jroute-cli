@@ -108,7 +108,7 @@ def print_console_banner(decision: dict[str, Any], cmd: list[str]) -> None:
         f"kritiklik={m['critical_probability']}\n"
         f"  ├─ Olasılıklar  : {magenta}{probs_str}{reset}\n"
         f"  └─ Komut        : {dim}{' '.join(
-            [repr(a) if ' ' in a else a for a in cmd[:-1]] + [repr(cmd[-1][:60] + ('…' if len(cmd[-1]) > 60 else ''))]
+            [repr(a[:60] + ('…' if len(a) > 60 else '')) if ' ' in a else a for a in cmd]
         )}{reset}",
         file=sys.stderr,
     )
