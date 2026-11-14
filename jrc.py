@@ -22,6 +22,7 @@ from typing import Any
 # Aynı klasördeki router.py modülünü içe aktar
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import jrc_context  # noqa: E402
+import jrc_usage  # noqa: E402
 import router  # noqa: E402
 
 CONSOLE_COMMANDS = [
@@ -40,6 +41,7 @@ CONSOLE_COMMANDS = [
     "/cd",
     "/ctx",
     "/context",
+    "/usage",
     "/status",
     "/models",
     "/clear",
@@ -210,7 +212,7 @@ def _print_console_header(
         f"{cyan}│{reset} 📂 {bold}Dizin  :{reset} {cwd} {dim}[{stack}]{reset}\n"
         f"{cyan}│{reset} 🎯 {bold}Hedef  :{reset} {tool_str}   ⚙️  {bold}Mod :{reset} {' · '.join(modes)}\n"
         f"{cyan}│{reset} 🧠 {bold}Hafıza :{reset} {green}.jrc_context.md{reset} {dim}[{mem_tag}]{reset}\n"
-        f"{cyan}│{reset} 💡 {dim}Komut  : /claude · /agy · /auto · /ctx · /d · /p · /y · /m · /help · q / Ctrl+C{reset}\n"
+        f"{cyan}│{reset} 💡 {dim}Komut  : /claude · /agy · /auto · /ctx · /usage · /d · /p · /y · /m · /help · q / Ctrl+C{reset}\n"
         f"{cyan}╰──────────────────────────────────────────────────────────────────────╯{reset}"
     )
 
@@ -235,6 +237,7 @@ def _print_console_help() -> None:
         f"  {cyan}/m | /multi{reset}      Çok satırlı mesaj giriş modunu başlatır (bitirmek için boş satırda . veya END)\n"
         f"  {cyan}/cd <dizin>{reset}      Çalışma dizinini değiştirir\n"
         f"  {cyan}/models{reset}          Desteklenen tüm araç ve alt model profillerini listeler\n"
+        f"  {cyan}/usage{reset}           Bağlı ürünlerin (agy, claude, ollaya) kullanım ve kota durumunu gösterir\n"
         f"  {cyan}/status{reset}          Aktif dizin ve mod durumunu gösterir\n"
         f"  {cyan}/clear{reset}           Ekranı temizler\n"
         f"  {cyan}q | exit | Ctrl+C | Ctrl+D{reset} Konsoldan çıkar\n"
@@ -349,6 +352,9 @@ def run_interactive_console(args: argparse.Namespace, extra_args: list[str]) -> 
                 _print_console_header(
                     target_cwd, forced_tool, print_mode, dry_run, skip_permissions, decision_model
                 )
+                continue
+            if cmd_name in ("/usage", "/u"):
+                jrc_usage.print_usage_report(target_cwd, as_json=getattr(args, "json", False))
                 continue
             if cmd_name == "/models":
                 print("\n\033[1mDesteklenen Jev Route Profilleri:\033[0m")
@@ -671,6 +677,10 @@ def main() -> int:
     )
 
     args, unknown = parser.parse_known_args()
+    if unknown and unknown[0].lower() == "usage":
+        target_cwd = Path(args.cwd).resolve() if args.cwd else Path.cwd()
+        jrc_usage.print_usage_report(target_cwd, as_json=args.json)
+        return 0
     return run_interactive_console(args, unknown)
 
 
