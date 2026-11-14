@@ -1,75 +1,105 @@
-# Jev & Ollaya — Yerel Karar Motoru ve CLI Üst Router (`jroute`)
+# jroute-cli — Intelligent CLI Meta-Router for Claude Code & Antigravity (`jroute` & `jrc`)
 
-Bu klasör (`/home/efe/Desktop/projeler/jev`), **TypeSafe AI Jev SDK / CLI** araçlarını, yerel Jev uyumlu karar modeli sunucusu **Ollaya** yapılandırmasını ve terminalden verilen görevleri tek adımda analiz ederek en uygun aracı (**`claude`** veya **`agy`**) ve alt modeli seçip başlatan **`jroute` (`jev-router`)** betiğini içerir.
+**jroute-cli** is a local System-1 decision router powered by the **TypeSafe AI Jev SDK** (`system_one`) and a local **Ollaya** server. It analyzes developer prompts alongside the active workspace context (`cwd`, project files, tech stack markers) in a single pass—evaluating task complexity (`Score`), production risk (`Noul`), and tool fit (`Choice`)—to automatically select and launch the optimal CLI agent (**Claude Code** or **Antigravity / `agy`**), sub-model, and reasoning effort level.
 
-## 1. Kurulu Bileşenler
+---
 
-| Bileşen | Konum / Paket | Açıklama |
-| :--- | :--- | :--- |
-| **Ollaya Sunucusu** | `/home/efe/.local/bin/ollaya` (`ollaya.service`) | `http://127.0.0.1:11435` adresinde `/v1/systemone` Jev API uyumlu yerel karar modeli sunucusu |
-| **Jev CLI** | `/home/efe/.local/bin/jev` | Terminalden `jev noul`, `jev choice`, `jev score`, `jev eval` çalıştıran CLI (yerel Ollaya'ya bağlı) |
-| **TypeSafe Python SDK** | `/home/efe/Desktop/projeler/jev/.venv` (`typesafe-sdk`) | Resmi Python SDK (`TypeSafeClient`, `Choice`, `Score`, `Noul`) |
-| **TypeSafe JS/TS SDK** | `/home/efe/Desktop/projeler/jev/node_modules/@typesafe-ai/sdk` | Resmi TypeScript/JavaScript SDK |
-| **Üst Router Betiği** | `/home/efe/Desktop/projeler/jev/router.py` (`jroute` / `jev-router`) | Görevi tek adımda analiz edip `claude` veya `agy` + alt model + efor seçerek başlatan betik |
-| **Etkileşimli Konsol** | `/home/efe/Desktop/projeler/jev/jrc.py` (`jrc`) | Terminalde `jrc` yazıldığında mesaj girilebilen etkileşimli CLI konsol arayüzü |
+## Features
 
-## 2. Üst Router (`jroute` & `jrc`) Kullanımı
+- **Single-Pass System-1 Routing**: Evaluates `route`, `tool`, `complexity`, and `is_critical` simultaneously via `client.system_one(...)` on a local Ollaya endpoint (`http://127.0.0.1:11435`).
+- **Workspace-Aware Context**: Automatically detects stack markers (`python`, `node/js`, `rust`, `go`, `docker`, `odoo`, `git-repo`) and top-level project files before routing.
+- **Dynamic Sub-Model & Effort Calibration**: Automatically scales reasoning effort (`low`, `medium`, `high`, `xhigh`) and upgrades sub-models when high complexity or production criticality is detected.
+- **Two CLI Entrypoints**:
+  - `jroute`: Fast single-command CLI router for direct execution, piping, `--dry-run`, and `--json` inspection.
+  - `jrc`: Interactive terminal REPL console with live spinner, readline history, tab completion, multi-line input, and inline slash commands.
 
-Terminalde doğrudan konsol arayüzünü açmak için `jrc`, tek satırda görev vermek için `jroute` komutunu kullanabilirsiniz:
+---
+
+## Supported Route Profiles
+
+| Profile Key | CLI Tool | Sub-Model | Default Effort | Target Use Cases |
+| :--- | :--- | :--- | :--- | :--- |
+| `claude_haiku` | `claude` | `claude-haiku-5-5` | `low` | Fast Git operations (`commit`, `push`, `branch`), small script tweaks, formatting, README edits |
+| `claude_sonnet` | `claude` | `claude-sonnet-5-5` | `medium` / `high` | Standard software engineering, bug fixes, feature implementation, refactoring, unit tests |
+| `claude_opus` | `claude` | `claude-opus-5-5` | `high` / `xhigh` | Complex multi-file refactoring, critical production debugging, database/ORM architecture (Odoo, PostgreSQL) |
+| `agy_flash` | `agy` | `gemini-3.8-flash-low\|medium` | `low` | Quick lookups, status checks, log inspection, simple shell commands |
+| `agy_argon` | `agy` | `gemini-4-argon-medium\|high` | `medium` / `high` | Full-stack web development, UI/UX design, API/webhook integration, bots, multi-step automation |
+| `agy_hydrogen` | `agy` | `gemini-4-hydrogen-high\|xhigh` | `high` / `xhigh` | Deep research, multi-agent orchestration, complex algorithmic & system-wide design |
+
+---
+
+## Installation
+
+1. **Install dependencies**:
+   ```bash
+   python3 -m venv .venv
+   .venv/bin/pip install -r requirements.txt
+   ```
+
+2. **Symlink `jroute` and `jrc` to your PATH**:
+   ```bash
+   chmod +x router.py jrc.py
+   ln -sf "$(pwd)/router.py" ~/.local/bin/jroute
+   ln -sf "$(pwd)/jrc.py" ~/.local/bin/jrc
+   ```
+
+3. **Environment Variables (Optional)**:
+   - `TYPESAFE_BASE_URL`: Ollaya / Jev API endpoint (default: `http://127.0.0.1:11435`)
+   - `TYPESAFE_API_KEY`: API key (default: `local`)
+   - `TYPESAFE_DEFAULT_MODEL`: Decision model name (default: `largha`)
+
+---
+
+## Usage
+
+### 1. Interactive Terminal Console (`jrc`)
+
+Run `jrc` without arguments from any project directory to open the interactive console:
 
 ```bash
-# 1. Etkileşimli Konsol Arayüzü (jrc):
 jrc
-# Konsol açıldığında mesajınızı doğrudan yazıp Enter'a basabilirsiniz.
-# Konsol içi komutlar:
-#   /claude, /agy, /auto  -> Hedef aracı sabitle veya otomatiğe al
-#   /d, !d <mesaj>        -> Komutu başlatmadan sadece Jev kararını test et
-#   /p, !p <mesaj>        -> Tek seferlik (--print) modda çalıştırıp konsola dön
-#   /y                    -> --dangerously-skip-permissions modunu aç/kapat
-#   /m                    -> Çok satırlı mesaj girişi
-#   /cd <dizin>           -> Çalışma dizinini değiştir
-#   /models, /help, q     -> Profil listesi, yardım ve çıkış
-
-# 2. Doğrudan Tek Komutla Çalıştırma (jroute):
-jroute "eretnastore.com sepet sayfasındaki mobil görünüm hatasını düzelt"
-
-# Tek seferlik (--print / -p) modda çalıştırmak için:
-jroute -p "log dosyasında son 20 satırdaki hataları özetle"
-
-# Aracı zorlayıp yalnızca alt modeli ve efor seviyesini Jev'e seçtirmek için:
-jroute -t claude "odoo stok hareketleri sorgusunu optimize et"
-jroute -t agy "xaura.net için yeni sonuçlar sayfası tasarla"
-
-# Komutu çalıştırmadan sadece Jev kararını ve üretilen komutu görmek için (--dry-run / -d):
-jroute -d "commit push"
-
-# Karar detaylarını ve olasılık dağılımını JSON olarak görmek için:
-jroute --json "PostgreSQL deadlock sorununu analiz et"
 ```
 
-### Desteklenen Alt Model Profilleri
+```text
+╭──────────────────────────────────────────────────────────────────────╮
+│ ⚡ Jev Router Konsolu (jrc) (Ollaya: largha)
+│ 📂 Dizin : /path/to/workspace [python, git-repo]
+│ 🎯 Hedef : otomatik (claude / agy)   ⚙️  Mod : interaktif
+│ 💡 Komut : /claude · /agy · /auto · /d (test) · /p (print) · /m (çok satır) · /help · q
+╰──────────────────────────────────────────────────────────────────────╯
+jrc [auto] ❯ 
+```
 
-Router, tek bir `client.system_one(...)` çağrısında görevin içeriğini, çalışma dizini bağlamını (`cwd`, dosya yapısı, teknoloji yığını), karmaşıklık seviyesini (`Score`) ve kritiklik olasılığını (`Noul`) değerlendirerek şu profiller arasından seçim yapar:
+#### Console Commands & Prefixes
+- `<prompt>`: Analyzes the prompt with Jev and launches the selected CLI agent (`claude` or `agy`).
+- `!d <prompt>` / `/d`: Dry-run mode — displays the routing decision, probability distribution, and generated CLI command without executing it.
+- `!p <prompt>` / `/p`: One-shot print mode (`-p`) — runs the agent in non-interactive print mode and returns to the `jrc` prompt.
+- `@claude <prompt>` / `@agy <prompt>`: Forces `claude` or `agy` for a single message while letting Jev pick the optimal sub-model and effort.
+- `/claude`, `/agy`, `/auto`: Pins the target CLI tool for the session or resets to automatic routing.
+- `/y`: Toggles `--dangerously-skip-permissions`.
+- `/m` (or trailing `\`): Multi-line prompt input mode.
+- `/cd <dir>`: Changes the active workspace directory inside the console.
+- `/models`: Lists all available routing profiles and criteria.
+- `/help`, `/clear`, `q` / `exit`: Help, clear screen, or exit.
 
-- **`claude` (Claude Code CLI)**
-  - `claude-haiku-5-5` (`effort=low`): Hızlı git işlemleri (`commit`, `push`), küçük betik ve metin düzenlemeleri
-  - `claude-sonnet-5-5` (`effort=medium|high`): Standart yazılım geliştirme, hata ayıklama (bugfix), refactoring ve test yazımı
-  - `claude-opus-5-5` (`effort=high|xhigh`): Karmaşık çok dosyalı mimari değişiklikler, kritik veritabanı/backend (Odoo, PostgreSQL) sorunları
-- **`agy` (Antigravity CLI)**
-  - `gemini-3.8-flash-low|medium` (`effort=low`): Hızlı durum kontrolü, log inceleme, tek adımlık sorgular
-  - `gemini-4-argon-medium|high` (`effort=medium|high`): Tam yığın (full-stack) web geliştirme, UI/UX tasarım, API/bot entegrasyonu, çok adımlı otomasyon
-  - `gemini-4-hydrogen-high|xhigh` (`effort=high|xhigh`): Derin araştırma, karmaşık sistem tasarımı ve çoklu ajan orkestrasyonu
+---
 
-## 3. Doğrudan `jev` CLI ve `ollaya` Kullanımı
+### 2. Direct Single-Command Router (`jroute`)
 
 ```bash
-# Evet/Hayır olasılığı (Noul):
-jev noul "Bu mesaj acil mi?" --state "Sunucu çöktü, siparişler düşmüyor!"
+# Analyze the task and launch the chosen CLI agent interactively:
+jroute "Fix the mobile layout issue on the checkout page"
 
-# Çoktan seçmeli karar (Choice):
-jev choice "Hangi departman?" --state "Faturam iki kez kesildi" \
-  --option muhasebe="Ödeme ve fatura" --option teknik="Yazılım hatası" --option diger
+# Run in one-shot (--print / -p) mode:
+jroute -p "Summarize the errors in the last 20 lines of app.log"
 
-# Yerel modelleri listeleme:
-ollaya list
+# Force a specific CLI tool while letting Jev choose the sub-model and effort:
+jroute -t claude "Optimize the stock movement query in Odoo"
+jroute -t agy "Design a new analytics dashboard page"
+
+# Preview the routing decision and generated command without running (--dry-run / -d):
+jroute -d "commit push"
+
+# Output full routing metrics and probability distributions as JSON:
+jroute --json "Analyze the PostgreSQL deadlock issue"
 ```
