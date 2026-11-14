@@ -71,7 +71,7 @@ jrc
 │ 📂 Dizin  : /path/to/workspace [python]
 │ 🎯 Hedef  : otomatik (claude / agy)   ⚙️  Mod : interaktif · skip-perms (-y)
 │ 🧠 Hafıza : .jrc_context.md [3 görev · 2 son değişiklik]
-│ 💡 Komut  : /claude · /agy · /auto · /ctx · /d · /p · /y · /m · /help · q
+│ 💡 Komut  : /claude · /agy · /auto · /ctx · /d · /p · /y · /m · /help · q / Ctrl+C
 ╰──────────────────────────────────────────────────────────────────────╯
 jrc [auto·yes] ❯ 
 ```
@@ -91,7 +91,7 @@ jrc [auto·yes] ❯
 - `/m` (or trailing `\`): Multi-line prompt input mode.
 - `/cd <dir>`: Changes the active workspace directory inside the console and syncs its memory layer.
 - `/models`: Lists all available routing profiles and criteria.
-- `/help`, `/clear`, `q` / `exit`: Help, clear screen, or exit.
+- `/help`, `/clear`, `q` / `exit` / `Ctrl+C`: Help, clear screen, or exit.
 
 ---
 

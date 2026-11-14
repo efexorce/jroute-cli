@@ -210,7 +210,7 @@ def _print_console_header(
         f"{cyan}│{reset} 📂 {bold}Dizin  :{reset} {cwd} {dim}[{stack}]{reset}\n"
         f"{cyan}│{reset} 🎯 {bold}Hedef  :{reset} {tool_str}   ⚙️  {bold}Mod :{reset} {' · '.join(modes)}\n"
         f"{cyan}│{reset} 🧠 {bold}Hafıza :{reset} {green}.jrc_context.md{reset} {dim}[{mem_tag}]{reset}\n"
-        f"{cyan}│{reset} 💡 {dim}Komut  : /claude · /agy · /auto · /ctx · /d · /p · /y · /m · /help · q{reset}\n"
+        f"{cyan}│{reset} 💡 {dim}Komut  : /claude · /agy · /auto · /ctx · /d · /p · /y · /m · /help · q / Ctrl+C{reset}\n"
         f"{cyan}╰──────────────────────────────────────────────────────────────────────╯{reset}"
     )
 
@@ -237,7 +237,7 @@ def _print_console_help() -> None:
         f"  {cyan}/models{reset}          Desteklenen tüm araç ve alt model profillerini listeler\n"
         f"  {cyan}/status{reset}          Aktif dizin ve mod durumunu gösterir\n"
         f"  {cyan}/clear{reset}           Ekranı temizler\n"
-        f"  {cyan}q | exit | Ctrl+D{reset} Konsoldan çıkar\n"
+        f"  {cyan}q | exit | Ctrl+C | Ctrl+D{reset} Konsoldan çıkar\n"
         f"  {dim}İpucu: Satır sonuna '\\' koyarak da alt satıra devam edebilirsiniz.{reset}\n"
     )
 
@@ -300,21 +300,27 @@ def run_interactive_console(args: argparse.Namespace, extra_args: list[str]) -> 
 
         try:
             raw = input(prompt)
-        except KeyboardInterrupt:
-            print()
-            continue
-        except EOFError:
+        except (KeyboardInterrupt, EOFError):
             print()
             break
 
+        cancelled = False
         while raw.endswith("\\"):
             raw = raw[:-1] + "\n"
             try:
                 cont = input("\001\033[2m\002  … ❯ \001\033[0m\002")
                 raw += cont
-            except (KeyboardInterrupt, EOFError):
-                print()
+            except KeyboardInterrupt:
+                print("\n\033[2mGiriş iptal edildi.\033[0m")
+                cancelled = True
                 break
+            except EOFError:
+                print()
+                cancelled = True
+                break
+
+        if cancelled:
+            continue
 
         text = raw.strip()
         if not text:
@@ -531,6 +537,9 @@ def run_interactive_console(args: argparse.Namespace, extra_args: list[str]) -> 
                     decision_model=decision_model,
                     forced_tool=one_shot_tool,
                 )
+        except KeyboardInterrupt:
+            print("\n\033[2mİşlem iptal edildi.\033[0m\n")
+            continue
         except Exception as exc:
             print(f"\033[31m✗ Jev analiz hatası:\033[0m {exc}", file=sys.stderr)
             continue
@@ -601,6 +610,7 @@ def run_interactive_console(args: argparse.Namespace, extra_args: list[str]) -> 
         except Exception:
             pass
 
+    _save_history(history_file)
     return 0
 
 
