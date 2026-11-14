@@ -21,13 +21,17 @@ import time
 from pathlib import Path
 from typing import Any
 
+import jrc_context
 from typesafe_sdk import Choice, Noul, Score, TypeSafeClient
 
 # Claude'a emrin JEV router'dan geldiğini bildiren bağlam (ayrıntı: ~/.claude/CLAUDE.md "JEV" bölümü).
 JEV_SYSTEM_PROMPT = (
     "Bu emir JEV router'dan (jroute/jrc) geldi; kullanıcı Mustafa'nın JEV iş akışıdır. "
     "/home/efe çöplük değil, JEV klasörüdür; bu tür işlemlerde kullanılır. "
-    "İzinsiz taşıma/silme/temizlik yapma. Dizin haritası ve kurallar için ~/.claude/CLAUDE.md içindeki JEV bölümüne bak."
+    "İzinsiz taşıma/silme/temizlik yapma. Dizin haritası ve kurallar için ~/.claude/CLAUDE.md içindeki JEV bölümüne bak. "
+    "Bu projede Git KULLANILMAMAKTADIR. Projenin ortak hafıza katmanı, görev geçmişi, son değişen dosyalar "
+    "ve mimari kararlar proje kökündeki '.jrc_context.md' dosyasında tutulur. Göreve başlamadan önce .jrc_context.md "
+    "içeriğini oku, bağlamı koru ve aldığın kritik mimari kararları bu dosyadaki 'Ortak Notlar' bölümüne ekle."
 )
 os.environ["JEV_ORIGIN"] = "1"  # exec/subprocess ile çocuk sürece geçer
 
@@ -73,8 +77,8 @@ ROUTE_PROFILES: dict[str, dict[str, str]] = {
         "default_effort": "low",
         "label": "Claude Code · Haiku 5.5",
         "criteria": (
-            "Fast git operations (commit, push, branch), small script tweaks, "
-            "formatting, README updates, or lightweight file edits."
+            "Small script tweaks, formatting, README updates, memory/status checks, "
+            "or lightweight single-file edits."
         ),
     },
     "claude_sonnet": {
@@ -132,7 +136,7 @@ def ensure_ollaya_running(base_url: str) -> None:
 
 
 def collect_workspace_context(cwd: Path) -> dict[str, Any]:
-    """Çalışma klasöründeki proje tipini ve dosyaları özetler."""
+    """Çalışma klasöründeki proje tipini, dosyaları ve ortak hafızayı (.jrc_context.md) özetler."""
     try:
         entries = sorted(p.name for p in cwd.iterdir() if not p.name.startswith("."))[:25]
     except Exception:
@@ -147,16 +151,21 @@ def collect_workspace_context(cwd: Path) -> dict[str, Any]:
         ("go.mod", "go"),
         ("docker-compose.yml", "docker"),
         ("odoo", "odoo"),
-        (".git", "git-repo"),
     ]:
         if (cwd / name).exists():
             markers.append(label)
+
+    # Ortak hafıza katmanı kontrolü (.jrc_context.md)
+    mem_summary = jrc_context.get_workspace_memory_summary(cwd)
+    if mem_summary["has_memory"]:
+        markers.append("hafıza-aktif")
 
     return {
         "cwd": str(cwd),
         "project_name": cwd.name,
         "stack_markers": markers,
         "top_files": entries,
+        "memory": mem_summary,
     }
 
 
@@ -271,12 +280,15 @@ def analyze_task_with_jev(
     if crit_prob >= 0.75 and effort in ("low", "medium"):
         effort = "high"
 
-    # Çok basit görevlerde (ör. commit push, durum kontrolü) hafif alt modeli tercih et
+    # Çok basit görevlerde (ör. durum kontrolü, hafıza sorgusu) hafif alt modeli tercih et
     lower_task = task.lower().strip()
-    is_quick_git = bool(
-        re.fullmatch(r"(git\s+)?(commit|push|status|pull|diff)(\s+et)?(\s+push)?", lower_task)
+    is_quick_task = bool(
+        re.fullmatch(
+            r"(git\s+)?(status|durum|hafıza|kontrol|özet|liste|listele)(\s+et)?",
+            lower_task,
+        )
     )
-    if is_quick_git:
+    if is_quick_task:
         effort = "low"
         chosen_route_key = "claude_haiku" if target_tool == "claude" else "agy_flash"
     elif effort == "xhigh" or (effort == "high" and crit_prob >= 0.70):
@@ -347,15 +359,16 @@ def build_cli_command(
     cmd = ["agy", "--model", model, "--effort", effort]
     if skip_permissions:
         cmd.append("--dangerously-skip-permissions")
+    task_payload = task if ".jrc_context.md" in task else f"[Hafıza: .jrc_context.md] {task}"
     if print_mode:
-        cmd.extend(["-p", task])
+        cmd.extend(["-p", task_payload])
     else:
-        cmd.extend(["-i", task])
+        cmd.extend(["-i", task_payload])
     cmd.extend(extra)
     return cmd
 
 
-def print_banner(decision: dict[str, Any], cmd: list[str]) -> None:
+def print_banner(decision: dict[str, Any], cmd: list[str], cwd: Path | None = None) -> None:
     """Seçim özetini terminale renkli ve okunaklı biçimde yazdırır."""
     bold = "\033[1m"
     cyan = "\033[36m"
@@ -363,6 +376,10 @@ def print_banner(decision: dict[str, Any], cmd: list[str]) -> None:
     yellow = "\033[33m"
     dim = "\033[2m"
     reset = "\033[0m"
+
+    target_dir = cwd or Path.cwd()
+    mem = jrc_context.get_workspace_memory_summary(target_dir)
+    mem_tag = f" · {mem['task_count']} görev kayıtlı" if mem["has_memory"] else " · yeni başlatıldı"
 
     m = decision["metrics"]
     tool_badge = f"{green}claude{reset}" if decision["tool"] == "claude" else f"{cyan}agy{reset}"
@@ -372,6 +389,7 @@ def print_banner(decision: dict[str, Any], cmd: list[str]) -> None:
         f"  ├─ Efor & Risk  : effort={yellow}{decision['effort']}{reset} | "
         f"karmaşıklık={m['complexity_level']} ({m['complexity_score']}) | "
         f"kritiklik={m['critical_probability']}\n"
+        f"  ├─ Ortak Hafıza : {green}.jrc_context.md{reset} {dim}[Git-free{mem_tag}]{reset}\n"
         f"  └─ Komut        : {dim}{' '.join(
             [repr(a[:60] + ('…' if len(a) > 60 else '')) if ' ' in a else a for a in cmd]
         )}{reset}",
@@ -457,14 +475,21 @@ def main() -> int:
     )
 
     if args.json:
-        output = {**decision, "command": cmd, "cwd": str(target_cwd)}
+        mem_info = jrc_context.get_workspace_memory_summary(target_cwd)
+        output = {**decision, "command": cmd, "cwd": str(target_cwd), "memory": mem_info}
         print(json.dumps(output, ensure_ascii=False, indent=2))
         return 0
 
-    print_banner(decision, cmd)
+    print_banner(decision, cmd, cwd=target_cwd)
 
     if args.dry_run:
         return 0
+
+    # Görev öncesi ortak hafıza katmanını (.jrc_context.md) saf Python ile güncelle
+    try:
+        jrc_context.record_task_and_sync(target_cwd, task_text, decision)
+    except Exception as exc:
+        sys.stderr.write(f"Hafıza güncellenirken uyarı: {exc}\n")
 
     if args.cwd:
         os.chdir(target_cwd)

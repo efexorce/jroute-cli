@@ -21,6 +21,7 @@ from typing import Any
 
 # Aynı klasördeki router.py modülünü içe aktar
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import jrc_context  # noqa: E402
 import router  # noqa: E402
 
 CONSOLE_COMMANDS = [
@@ -37,6 +38,8 @@ CONSOLE_COMMANDS = [
     "/m",
     "/multi",
     "/cd",
+    "/ctx",
+    "/context",
     "/status",
     "/models",
     "/clear",
@@ -85,7 +88,7 @@ class Spinner:
             sys.stderr.flush()
 
 
-def print_console_banner(decision: dict[str, Any], cmd: list[str]) -> None:
+def print_console_banner(decision: dict[str, Any], cmd: list[str], cwd: Path | None = None) -> None:
     """Seçim özetini olasılık dağılımıyla birlikte terminale yazdırır."""
     bold = "\033[1m"
     cyan = "\033[36m"
@@ -94,6 +97,10 @@ def print_console_banner(decision: dict[str, Any], cmd: list[str]) -> None:
     magenta = "\033[35m"
     dim = "\033[2m"
     reset = "\033[0m"
+
+    target_dir = cwd or Path.cwd()
+    mem = jrc_context.get_workspace_memory_summary(target_dir)
+    mem_tag = f" · {mem['task_count']} görev kayıtlı" if mem["has_memory"] else " · yeni başlatıldı"
 
     m = decision["metrics"]
     tool_badge = f"{green}claude{reset}" if decision["tool"] == "claude" else f"{cyan}agy{reset}"
@@ -107,6 +114,7 @@ def print_console_banner(decision: dict[str, Any], cmd: list[str]) -> None:
         f"karmaşıklık={m['complexity_level']} ({m['complexity_score']}) | "
         f"kritiklik={m['critical_probability']}\n"
         f"  ├─ Olasılıklar  : {magenta}{probs_str}{reset}\n"
+        f"  ├─ Ortak Hafıza : {green}.jrc_context.md{reset} {dim}[Git-free{mem_tag}]{reset}\n"
         f"  └─ Komut        : {dim}{' '.join(
             [repr(a[:60] + ('…' if len(a) > 60 else '')) if ' ' in a else a for a in cmd]
         )}{reset}",
@@ -181,6 +189,8 @@ def _print_console_header(
 
     ws = router.collect_workspace_context(cwd)
     stack = ", ".join(ws["stack_markers"]) if ws["stack_markers"] else "genel"
+    mem = jrc_context.get_workspace_memory_summary(cwd)
+    mem_tag = f"{mem['task_count']} görev · {mem['modified_count']} son değişiklik" if mem["has_memory"] else "başlatılıyor"
     tool_str = (
         f"{green}claude{reset}"
         if forced_tool == "claude"
@@ -197,9 +207,10 @@ def _print_console_header(
     print(
         f"{cyan}╭──────────────────────────────────────────────────────────────────────╮{reset}\n"
         f"{cyan}│{reset} {bold}⚡ Jev Router Konsolu (jrc){reset} {dim}(Ollaya: {decision_model}){reset}\n"
-        f"{cyan}│{reset} 📂 {bold}Dizin :{reset} {cwd} {dim}[{stack}]{reset}\n"
-        f"{cyan}│{reset} 🎯 {bold}Hedef :{reset} {tool_str}   ⚙️  {bold}Mod :{reset} {' · '.join(modes)}\n"
-        f"{cyan}│{reset} 💡 {dim}Komut : /claude · /agy · /auto · /d (test) · /p (print) · /y · /m (çok satır) · /help · q{reset}\n"
+        f"{cyan}│{reset} 📂 {bold}Dizin  :{reset} {cwd} {dim}[{stack}]{reset}\n"
+        f"{cyan}│{reset} 🎯 {bold}Hedef  :{reset} {tool_str}   ⚙️  {bold}Mod :{reset} {' · '.join(modes)}\n"
+        f"{cyan}│{reset} 🧠 {bold}Hafıza :{reset} {green}.jrc_context.md{reset} {dim}[{mem_tag}]{reset}\n"
+        f"{cyan}│{reset} 💡 {dim}Komut  : /claude · /agy · /auto · /ctx · /d · /p · /y · /m · /help · q{reset}\n"
         f"{cyan}╰──────────────────────────────────────────────────────────────────────╯{reset}"
     )
 
@@ -217,7 +228,8 @@ def _print_console_help() -> None:
         f"  {cyan}@claude <mesaj>{reset}  Sadece bu mesaj için Claude Code seçmeye zorlar\n"
         f"  {cyan}@agy <mesaj>{reset}     Sadece bu mesaj için Antigravity (agy) seçmeye zorlar\n"
         f"  {cyan}/claude | /agy | /auto{reset} Varsayılan hedef aracı değiştirir\n"
-        f"  {cyan}/d | /dry{reset}        Dry-run (sadece karar testi) modunu aç/kapat\n"
+        f"  {cyan}/ctx | /context{reset}        Ortak hafıza (.jrc_context.md) özetini gösterir (/ctx sync, /ctx note ...)\n"
+        f"  {cyan}/d | /dry{reset}              Dry-run (sadece karar testi) modunu aç/kapat\n"
         f"  {cyan}/p | /print{reset}      Print (-p) modunu aç/kapat\n"
         f"  {cyan}/y | /yes{reset}        İzin atlama (--dangerously-skip-permissions) modunu aç/kapat\n"
         f"  {cyan}/m | /multi{reset}      Çok satırlı mesaj giriş modunu başlatır (bitirmek için boş satırda . veya END)\n"
@@ -398,6 +410,68 @@ def run_interactive_console(args: argparse.Namespace, extra_args: list[str]) -> 
                     continue
                 if not text:
                     continue
+            elif cmd_name in ("/ctx", "/context"):
+                ctx_args = cmd_arg.split(maxsplit=1)
+                sub_cmd = ctx_args[0].lower() if ctx_args else ""
+                sub_val = ctx_args[1].strip() if len(ctx_args) > 1 else ""
+
+                if sub_cmd in ("note", "not"):
+                    if not sub_val:
+                        print("\033[33mKullanım: /ctx note <kalıcı not metni>\033[0m")
+                    else:
+                        ok = jrc_context.append_user_note(target_cwd, sub_val)
+                        if ok:
+                            print(f"\033[32m✓ Not .jrc_context.md dosyasına eklendi:\033[0m {sub_val}")
+                        else:
+                            print("\033[31m✗ Not eklenirken hata oluştu.\033[0m")
+                    continue
+                elif sub_cmd in ("sync", "refresh", "tara"):
+                    state, ctx_file = jrc_context.sync_workspace_memory(target_cwd)
+                    changes = state.get("recent_changes", {})
+                    mod_c = len(changes.get("modified", []))
+                    add_c = len(changes.get("added", []))
+                    del_c = len(changes.get("deleted", []))
+                    print(
+                        f"\033[32m✓ .jrc_context.md güncellendi:\033[0m "
+                        f"{len(state.get('file_snapshot', {}))} dosya tarandı | "
+                        f"+{add_c} yeni · ~{mod_c} değişen · -{del_c} silinen"
+                    )
+                    continue
+                elif sub_cmd in ("cat", "show", "goster", "full"):
+                    ctx_file = target_cwd / jrc_context.CONTEXT_FILENAME
+                    if ctx_file.exists():
+                        print(f"\n\033[1m--- {ctx_file} ---\033[0m\n")
+                        print(ctx_file.read_text(encoding="utf-8"))
+                        print("\033[1m----------------------------------------\033[0m\n")
+                    else:
+                        print(f"\033[33mHenüz {jrc_context.CONTEXT_FILENAME} oluşturulmadı. /ctx sync ile oluşturabilirsiniz.\033[0m")
+                    continue
+                else:
+                    mem = jrc_context.get_workspace_memory_summary(target_cwd)
+                    ctx_file = target_cwd / jrc_context.CONTEXT_FILENAME
+                    print(f"\n\033[1;36m🧠 JRC Ortak Hafıza Özeti (.jrc_context.md):\033[0m")
+                    print(f"  ├─ Konum        : {ctx_file} {'(\033[32mmevcut\033[0m)' if ctx_file.exists() else '(\033[33mhenüz yok\033[0m)'}")
+                    print(f"  ├─ Toplam Görev : {mem['task_count']} adet kayıtlı")
+                    if mem["recent_tasks"]:
+                        print(f"  ├─ Son Görevler :")
+                        for idx, t in enumerate(mem["recent_tasks"][:3], 1):
+                            t_short = (t[:70] + "…") if len(t) > 70 else t
+                            print(f"  │    {idx}. \033[2m{t_short}\033[0m")
+                    if mem["recent_modified_files"]:
+                        print(f"  ├─ Değişenler   : {', '.join(mem['recent_modified_files'][:5])}")
+                    user_notes = ""
+                    if ctx_file.exists():
+                        try:
+                            user_notes = jrc_context.extract_user_notes(ctx_file.read_text(encoding="utf-8"))
+                        except Exception:
+                            user_notes = ""
+                    if user_notes:
+                        notes_disp = (user_notes[:100] + "…") if len(user_notes) > 100 else user_notes
+                        print(f"  └─ Kalıcı Notlar: \033[33m{notes_disp}\033[0m")
+                    else:
+                        print(f"  └─ Kalıcı Notlar: \033[2m(Henüz not eklenmedi. /ctx note <metin> ile ekleyebilirsiniz)\033[0m")
+                    print(f"\033[2mKomutlar: /ctx sync (yeniden tara) · /ctx note <metin> · /ctx cat (tamamı)\033[0m\n")
+                    continue
             elif cmd_name == "/cd":
                 if not cmd_arg:
                     print(f"Mevcut dizin: {target_cwd}")
@@ -410,10 +484,14 @@ def run_interactive_console(args: argparse.Namespace, extra_args: list[str]) -> 
                 if new_dir.is_dir():
                     target_cwd = new_dir
                     os.chdir(target_cwd)
+                    try:
+                        jrc_context.sync_workspace_memory(target_cwd)
+                    except Exception:
+                        pass
                     ws = router.collect_workspace_context(target_cwd)
                     stack = ", ".join(ws["stack_markers"]) if ws["stack_markers"] else "genel"
                     print(
-                        f"\033[32m✓ Çalışma dizini değiştirildi:\033[0m {target_cwd} \033[2m[{stack}]\033[0m"
+                        f"\033[32m✓ Çalışma dizini değiştirildi:\033[0m {target_cwd} \033[2m[{stack} · hafıza aktif]\033[0m"
                     )
                 else:
                     print(f"\033[31m✗ Dizin bulunamadı:\033[0m {new_dir}")
@@ -466,26 +544,62 @@ def run_interactive_console(args: argparse.Namespace, extra_args: list[str]) -> 
         )
 
         if args.json:
-            output = {**decision, "command": cmd, "cwd": str(target_cwd)}
+            mem_info = jrc_context.get_workspace_memory_summary(target_cwd)
+            output = {**decision, "command": cmd, "cwd": str(target_cwd), "memory": mem_info}
             print(json.dumps(output, ensure_ascii=False, indent=2))
             if one_shot_dry:
                 continue
             return 0
 
-        print_console_banner(decision, cmd)
+        print_console_banner(decision, cmd, cwd=target_cwd)
 
         if one_shot_dry:
             print()
             continue
+
+        # Görevi çalıştırmadan önce .jrc_context.md ortak hafıza katmanına kaydet
+        try:
+            jrc_context.record_task_and_sync(target_cwd, text, decision)
+        except Exception:
+            pass
 
         os.chdir(target_cwd)
         if one_shot_print:
             print()
             subprocess.run(cmd, cwd=str(target_cwd))
             print()
+            try:
+                jrc_context.sync_workspace_memory(target_cwd)
+            except Exception:
+                pass
             continue
 
-        os.execvp(cmd[0], cmd)
+        # İnteraktif oturumu çalıştır ve çıkışta jrc konsoluna dönerek hafızayı senkronize et
+        old_tc = None
+        try:
+            if sys.stdin.isatty():
+                import termios
+                old_tc = termios.tcgetattr(sys.stdin)
+        except Exception:
+            pass
+
+        try:
+            subprocess.run(cmd, cwd=str(target_cwd))
+        except KeyboardInterrupt:
+            print()
+        finally:
+            if old_tc is not None and sys.stdin.isatty():
+                try:
+                    import termios
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tc)
+                except Exception:
+                    pass
+
+        try:
+            jrc_context.sync_workspace_memory(target_cwd)
+            print("\n\033[32m✓ Ajan oturumu tamamlandı. .jrc_context.md hafızası güncellendi.\033[0m\n")
+        except Exception:
+            pass
 
     return 0
 

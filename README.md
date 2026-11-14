@@ -12,6 +12,11 @@
 - **Two CLI Entrypoints**:
   - `jroute`: Fast single-command CLI router for direct execution, piping, `--dry-run`, and `--json` inspection.
   - `jrc`: Interactive terminal REPL console with live spinner, readline history, tab completion, multi-line input, and inline slash commands.
+- **Git-Free Shared Memory Layer (`.jrc_context.md`)**:
+  - Pure Python workspace state tracking without any `git` dependency or command calls.
+  - Zero cloud token cost (100% local filesystem scanning, MD5 signatures, and metadata diffing).
+  - Bridges context between **Claude Code** and **Antigravity (`agy`)** across sessions.
+  - Automatically records task history, recent file modifications/additions/deletions, directory tree, and preserves persistent developer/agent architectural notes.
 
 ---
 
@@ -63,9 +68,10 @@ jrc
 ```text
 ╭──────────────────────────────────────────────────────────────────────╮
 │ ⚡ Jev Router Konsolu (jrc) (Ollaya: largha)
-│ 📂 Dizin : /path/to/workspace [python, git-repo]
-│ 🎯 Hedef : otomatik (claude / agy)   ⚙️  Mod : interaktif · skip-perms (-y)
-│ 💡 Komut : /claude · /agy · /auto · /d (test) · /p (print) · /y · /m (çok satır) · /help · q
+│ 📂 Dizin  : /path/to/workspace [python]
+│ 🎯 Hedef  : otomatik (claude / agy)   ⚙️  Mod : interaktif · skip-perms (-y)
+│ 🧠 Hafıza : .jrc_context.md [3 görev · 2 son değişiklik]
+│ 💡 Komut  : /claude · /agy · /auto · /ctx · /d · /p · /y · /m · /help · q
 ╰──────────────────────────────────────────────────────────────────────╯
 jrc [auto·yes] ❯ 
 ```
@@ -76,9 +82,14 @@ jrc [auto·yes] ❯
 - `!p <prompt>` / `/p`: One-shot print mode (`-p`) — runs the agent in non-interactive print mode and returns to the `jrc` prompt.
 - `@claude <prompt>` / `@agy <prompt>`: Forces `claude` or `agy` for a single message while letting Jev pick the optimal sub-model and effort.
 - `/claude`, `/agy`, `/auto`: Pins the target CLI tool for the session or resets to automatic routing.
+- `/ctx`, `/context`: Inspects the shared memory layer (`.jrc_context.md`).
+  - `/ctx`: Displays quick summary of recorded tasks, recent file changes, and architectural notes.
+  - `/ctx note <text>`: Appends a persistent rule or architectural decision to the memory layer.
+  - `/ctx sync`: Manually re-scans the filesystem and updates changes.
+  - `/ctx cat`: Prints the full `.jrc_context.md` file.
 - `/y` / `/yes`: Toggles `--dangerously-skip-permissions` (enabled by default).
 - `/m` (or trailing `\`): Multi-line prompt input mode.
-- `/cd <dir>`: Changes the active workspace directory inside the console.
+- `/cd <dir>`: Changes the active workspace directory inside the console and syncs its memory layer.
 - `/models`: Lists all available routing profiles and criteria.
 - `/help`, `/clear`, `q` / `exit`: Help, clear screen, or exit.
 
