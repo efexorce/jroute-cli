@@ -1,0 +1,55 @@
+{
+  "engine": "auto",
+  "analysis_timeout_s": 20,
+  "fallback_route": "agy_argon",
+  "default": {
+    "max_effort": "high"
+  },
+  "sources": {
+    "geocubot": {
+      "pin": "claude_haiku",
+      "effort": "low",
+      "max_effort": "low"
+    },
+    "geocubot_yedek": {
+      "pin": "claude_haiku",
+      "effort": "low",
+      "max_effort": "low"
+    },
+    "finansci": {
+      "pin": "claude_haiku",
+      "effort": "low",
+      "max_effort": "medium"
+    },
+    "urun_aciklama": {
+      "pin": "claude_haiku",
+      "effort": "low",
+      "max_effort": "medium"
+    },
+    "proxy": {
+      "pin": "agy_argon",
+      "effort": "low",
+      "max_effort": "high"
+    },
+    "hermes": {
+      "pin": "agy_argon",
+      "effort": "low",
+      "max_effort": "high"
+    },
+    "peribot": {
+      "pin": "agy_argon",
+      "effort": "medium",
+      "max_effort": "high"
+    },
+    "showcase": {
+      "pin": "agy_argon",
+      "effort": "low",
+      "max_effort": "high"
+    },
+    "foto_duzenle": {
+      "pin": "agy_carbon",
+      "effort": "low",
+      "max_effort": "high"
+    }
+  }
+}

@@ -22,6 +22,7 @@ from typing import Any
 # Aynı klasördeki router.py modülünü içe aktar
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import jrc_context  # noqa: E402
+import jrc_gate  # noqa: E402
 import jrc_usage  # noqa: E402
 import router  # noqa: E402
 
@@ -575,6 +576,7 @@ def run_interactive_console(args: argparse.Namespace, extra_args: list[str]) -> 
         # Görevi çalıştırmadan önce .jrc_context.md ortak hafıza katmanına kaydet
         try:
             jrc_context.record_task_and_sync(target_cwd, text, decision)
+            jrc_gate.record("jrc", decision, text)
         except Exception:
             pass
 
@@ -617,6 +619,43 @@ def run_interactive_console(args: argparse.Namespace, extra_args: list[str]) -> 
             pass
 
     _save_history(history_file)
+    return 0
+
+
+def run_gate_command(name: str, rest: list[str]) -> int:
+    """`jrc gate|audit|engine|policy` — bot/servis çağrılarının jrc geçidi kontrolü."""
+    bold, dim, green, yellow, red, reset = "\033[1m", "\033[2m", "\033[32m", "\033[33m", "\033[31m", "\033[0m"
+    if name == "engine":
+        if rest:
+            eng = jrc_gate.set_engine(rest[0].lower())
+            print(f"{green}✓ Motor kilidi: {eng}{reset}")
+        else:
+            print(f"Motor kilidi: {jrc_gate.load_policy().get('engine', 'auto')}  (kullanım: jrc engine auto|claude|agy)")
+        return 0
+    if name == "policy":
+        print(json.dumps(jrc_gate.load_policy(), ensure_ascii=False, indent=2))
+        print(f"{dim}Düzenle: {jrc_gate.POLICY_FILE}{reset}")
+        return 0
+    if name == "audit":
+        rows = jrc_gate.audit()
+        bad = [r for r in rows if not r["gated"]]
+        for r in rows:
+            mark = f"{green}geçitli{reset}" if r["gated"] else f"{red}DOĞRUDAN{reset}"
+            print(f"  {mark}  {r['file']}  {dim}satır {r['lines']}{reset}")
+        print(f"\n{bold}{len(rows)} dosya claude/agy referansı içeriyor, {len(bad)} tanesi geçide bağlı değil.{reset}")
+        return 1 if bad else 0
+    hours = float(rest[0]) if rest else 24.0
+    sm = jrc_gate.ledger_summary(hours)
+    pol = jrc_gate.load_policy()
+    print(f"\n{bold}⚡ JRC Geçidi{reset}  motor kilidi: {yellow}{pol.get('engine', 'auto')}{reset}  "
+          f"{dim}(son {hours:g} saat · {sm['decisions']} karar · {sm['fallbacks']} fallback){reset}")
+    for src, d in sorted(sm["by_source"].items()):
+        pin = pol["sources"].get(src, {}).get("pin")
+        dist = " · ".join(f"{k} ×{v}" for k, v in sorted(d.items(), key=lambda x: -x[1]))
+        print(f"  ├─ {bold}{src:<14}{reset} {dim}{'pin:' + pin if pin else 'analiz'}{reset}  {dist}")
+    if not sm["by_source"]:
+        print(f"  └─ {dim}henüz kayıt yok ({jrc_gate.LEDGER_FILE}){reset}")
+    print(f"{dim}Komutlar: jrc gate [saat] · jrc audit · jrc engine auto|claude|agy · jrc policy{reset}\n")
     return 0
 
 
@@ -677,6 +716,8 @@ def main() -> int:
     )
 
     args, unknown = parser.parse_known_args()
+    if unknown and unknown[0].lower() in ("gate", "audit", "engine", "policy"):
+        return run_gate_command(unknown[0].lower(), unknown[1:])
     if unknown and unknown[0].lower() == "usage":
         target_cwd = Path(args.cwd).resolve() if args.cwd else Path.cwd()
         jrc_usage.print_usage_report(target_cwd, as_json=args.json)

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import jrc_context
+from jrc_profiles import ROUTE_PROFILES, agy_model_for
 from typesafe_sdk import Choice, Noul, Score, TypeSafeClient
 
 # Claude'a emrin JEV router'dan geldiğini bildiren bağlam (ayrıntı: ~/.claude/CLAUDE.md "JEV" bölümü).
@@ -39,69 +40,7 @@ DEFAULT_BASE_URL = os.environ.get("TYPESAFE_BASE_URL", "http://127.0.0.1:11435")
 DEFAULT_API_KEY = os.environ.get("TYPESAFE_API_KEY", "local")
 DEFAULT_DECISION_MODEL = os.environ.get("TYPESAFE_DEFAULT_MODEL", "largha")
 
-# Route profilleri: Tek adımda (araç + alt model + varsayılan efor)
-ROUTE_PROFILES: dict[str, dict[str, str]] = {
-    "agy_flash": {
-        "tool": "agy",
-        "model": "gemini-3.8-flash-medium",
-        "default_effort": "low",
-        "label": "Antigravity · Gemini 3.8 Flash",
-        "criteria": (
-            "Quick lookups, status checks, log inspection, simple shell commands, "
-            "or trivial single-line questions that need fast execution."
-        ),
-    },
-    "agy_argon": {
-        "tool": "agy",
-        "model": "gemini-4-argon-medium",
-        "default_effort": "medium",
-        "label": "Antigravity · Gemini 4 Argon",
-        "criteria": (
-            "Full-stack web development, UI/frontend design, API/webhook integration, "
-            "automation bots (Telegram/WhatsApp), deployment, or multi-step workspace tasks."
-        ),
-    },
-    "agy_hydrogen": {
-        "tool": "agy",
-        "model": "gemini-4-hydrogen-high",
-        "default_effort": "high",
-        "label": "Antigravity · Gemini 4 Hydrogen",
-        "criteria": (
-            "Deep research, multi-agent orchestration, complex algorithmic design, "
-            "or system-wide investigation requiring maximum reasoning depth."
-        ),
-    },
-    "claude_haiku": {
-        "tool": "claude",
-        "model": "claude-haiku-5-5",
-        "default_effort": "low",
-        "label": "Claude Code · Haiku 5.5",
-        "criteria": (
-            "Small script tweaks, formatting, README updates, memory/status checks, "
-            "or lightweight single-file edits."
-        ),
-    },
-    "claude_sonnet": {
-        "tool": "claude",
-        "model": "claude-sonnet-5-5",
-        "default_effort": "medium",
-        "label": "Claude Code · Sonnet 5.5",
-        "criteria": (
-            "Standard software engineering, bug fixing, feature implementation, "
-            "code refactoring, writing unit tests, and clean code edits."
-        ),
-    },
-    "claude_opus": {
-        "tool": "claude",
-        "model": "claude-opus-5-5",
-        "default_effort": "high",
-        "label": "Claude Code · Opus 5.5",
-        "criteria": (
-            "Complex multi-file refactoring, critical production bug debugging, "
-            "database schema/ORM architecture (Odoo, PostgreSQL), and high-risk backend code."
-        ),
-    },
-}
+# Route profilleri jrc_profiles.py içinde (stdlib-only, jrc_gate ile ortak)
 
 
 def ensure_ollaya_running(base_url: str) -> None:
@@ -169,14 +108,36 @@ def collect_workspace_context(cwd: Path) -> dict[str, Any]:
     }
 
 
+def detect_explicit_route_override(task: str) -> str | None:
+    """Kullanıcı görev içinde açıkça belirli bir alt model istediyse (örn. 'işi fable yapsın', 'opus ile') algılar."""
+    lower = task.lower()
+    patterns: list[tuple[str, str]] = [
+        (r"\b(fable\s+(ile|yapsın|yap|kullan|çalıştır)|işi\s+fable|use\s+fable|model\s+fable)\b", "claude_fable"),
+        (r"\bfable\b", "claude_fable"),
+        (r"\b(opus\s+(ile|yapsın)|işi\s+opus|use\s+opus)\b", "claude_opus"),
+        (r"\b(sonnet\s+(ile|yapsın)|işi\s+sonnet|use\s+sonnet)\b", "claude_sonnet"),
+        (r"\b(haiku\s+(ile|yapsın)|işi\s+haiku|use\s+haiku)\b", "claude_haiku"),
+        (r"\b(argon\s+(ile|yapsın)|işi\s+argon|use\s+argon)\b", "agy_argon"),
+        (r"\b(carbon\s+(ile|yapsın)|işi\s+carbon|use\s+carbon)\b", "agy_carbon"),
+        (r"\b(hydrogen\s+(ile|yapsın)|işi\s+hydrogen|use\s+hydrogen)\b", "agy_hydrogen"),
+    ]
+    for pat, route_key in patterns:
+        if re.search(pat, lower):
+            return route_key
+    return None
+
+
 def detect_explicit_tool_override(task: str, forced_tool: str | None) -> str | None:
     """Kullanıcı görev içinde açıkça 'claude ile' veya 'agy ile' dediyse algılar."""
     if forced_tool in ("claude", "agy"):
         return forced_tool
+    explicit_route = detect_explicit_route_override(task)
+    if explicit_route and explicit_route in ROUTE_PROFILES:
+        return ROUTE_PROFILES[explicit_route]["tool"]
     lower = task.lower()
-    if re.search(r"\b(claude\s+ile|use\s+claude|claude\s+code\s+ile)\b", lower):
+    if re.search(r"\b(claude\s+(ile|yapsın)|işi\s+claude|use\s+claude|claude\s+code\s+ile)\b", lower):
         return "claude"
-    if re.search(r"\b(agy\s+ile|antigravity\s+ile|use\s+agy|gemini\s+ile)\b", lower):
+    if re.search(r"\b(agy\s+(ile|yapsın)|işi\s+agy|antigravity\s+ile|use\s+agy|gemini\s+(ile|yapsın))\b", lower):
         return "agy"
     return None
 
@@ -300,13 +261,18 @@ def _build_decision(task: str, forced_tool: str | None, response: Any, elapsed_m
         comp_level = "xhigh"
     crit_prob = float(crit_ans.noul)
 
-    # Kullanıcı açıkça araç belirttiyse veya tool sorusu yüksek güvenle farklı araç seçtiyse
+    # Kullanıcı açıkça model veya araç belirttiyse öncelik ver
+    explicit_route = detect_explicit_route_override(task) if forced_tool is None else None
     explicit_tool = detect_explicit_tool_override(task, forced_tool)
-    target_tool = explicit_tool or (
-        tool_ans.choice
-        if tool_ans.confidence >= 0.65 and ROUTE_PROFILES[chosen_route_key]["tool"] != tool_ans.choice
-        else ROUTE_PROFILES[chosen_route_key]["tool"]
-    )
+    if explicit_route and explicit_route in ROUTE_PROFILES:
+        chosen_route_key = explicit_route
+        target_tool = ROUTE_PROFILES[explicit_route]["tool"]
+    else:
+        target_tool = explicit_tool or (
+            tool_ans.choice
+            if tool_ans.confidence >= 0.65 and ROUTE_PROFILES[chosen_route_key]["tool"] != tool_ans.choice
+            else ROUTE_PROFILES[chosen_route_key]["tool"]
+        )
 
     # Eğer hedef araç chosen_route_key ile uyuşmuyorsa o aracın en uygun alt modelini seç
     if ROUTE_PROFILES[chosen_route_key]["tool"] != target_tool:
@@ -340,15 +306,9 @@ def _build_decision(task: str, forced_tool: str | None, response: Any, elapsed_m
     final_tool = profile["tool"]
     final_model = profile["model"]
 
-    # agy model isimlerinde efor soneki uyumu (gemini-4-argon-low/medium/high vb.)
+    # agy model isimlerinde efor soneki uyumu
     if final_tool == "agy":
-        agy_effort_suffix = "high" if effort in ("high", "xhigh") else ("low" if effort == "low" else "medium")
-        if final_model.startswith("gemini-4-argon"):
-            final_model = f"gemini-4-argon-{agy_effort_suffix}"
-        elif final_model.startswith("gemini-3.8-flash"):
-            final_model = f"gemini-3.8-flash-{agy_effort_suffix}"
-        elif final_model.startswith("gemini-4-hydrogen"):
-            final_model = "gemini-4-hydrogen-xhigh" if effort == "xhigh" else f"gemini-4-hydrogen-{agy_effort_suffix}"
+        final_model = agy_model_for(final_model, effort)
 
     return {
         "tool": final_tool,
@@ -526,6 +486,8 @@ def main() -> int:
     # Görev öncesi ortak hafıza katmanını (.jrc_context.md) saf Python ile güncelle
     try:
         jrc_context.record_task_and_sync(target_cwd, task_text, decision)
+        import jrc_gate
+        jrc_gate.record("jroute", decision, task_text)
     except Exception as exc:
         sys.stderr.write(f"Hafıza güncellenirken uyarı: {exc}\n")
 

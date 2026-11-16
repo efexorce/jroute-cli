@@ -1,5 +1,7 @@
 # jroute-cli — Intelligent CLI Meta-Router for Claude Code & Antigravity (`jroute` & `jrc`)
 
+[![Agensi Marketplace](https://img.shields.io/badge/Agensi.io-jroute--cli%20(%247)-2563eb)](https://www.agensi.io/skills/jroute-cli)
+
 **jroute-cli** is a local System-1 decision router powered by the **TypeSafe AI Jev SDK** (`system_one`) and a local **Ollaya** server. It analyzes developer prompts alongside the active workspace context (`cwd`, project files, tech stack markers) in a single pass—evaluating task complexity (`Score`), production risk (`Noul`), and tool fit (`Choice`)—to automatically select and launch the optimal CLI agent (**Claude Code** or **Antigravity / `agy`**), sub-model, and reasoning effort level.
 
 ---
@@ -114,3 +116,14 @@ jroute -d "commit push"
 # Output full routing metrics and probability distributions as JSON:
 jroute --json "Analyze the PostgreSQL deadlock issue"
 ```
+
+## JRC Geçidi (tüm botlar/servisler jrc'den geçer)
+
+Peribot (openclaw/Peri), geocubot, eretnabot ve Hermes `claude`/`agy` motorunu kendi seçemez.
+Karar tek yerde verilir: `jrc_gate.decide(kaynak, görev)`.
+
+- Politika: `jrc_policy.json` — kaynak başına `pin` (analizsiz sabit profil → 0 gecikme/0 token), `max_effort`, `allow_tools`; global `engine` (`auto|claude|agy`).
+- Defter: `~/.cache/jroute/gate.jsonl` (karar, fallback, sonuç).
+- Komutlar: `jrc gate [saat]` · `jrc audit` · `jrc engine auto|claude|agy` · `jrc policy`.
+- Bağlı noktalar (odoo): `maliyet_defteri.claude_calistir`, `argon_gemini_proxy.py` (Hermes+Peri), `hizli_yol.py`.
+- Kota fallback'ini de servis değil jrc yapar (`jrc_gate.fallback`); motor kilitliyse sessiz geçiş yapılmaz.
