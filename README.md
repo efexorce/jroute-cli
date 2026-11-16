@@ -1,6 +1,7 @@
 # jroute-cli — Intelligent CLI Meta-Router for Claude Code & Antigravity (`jroute` & `jrc`)
 
 [![Agensi Marketplace](https://img.shields.io/badge/Agensi.io-jroute--cli%20(%247)-2563eb)](https://www.agensi.io/skills/jroute-cli)
+[![Agensi Marketplace](https://img.shields.io/badge/Agensi.io-jroute--cli--manager%20(%241)-16a34a)](https://agensi.io/skills/jroute-cli-manager)
 
 **jroute-cli** is a local System-1 decision router powered by the **TypeSafe AI Jev SDK** (`system_one`) and a local **Ollaya** server. It analyzes developer prompts alongside the active workspace context (`cwd`, project files, tech stack markers) in a single pass—evaluating task complexity (`Score`), production risk (`Noul`), and tool fit (`Choice`)—to automatically select and launch the optimal CLI agent (**Claude Code** or **Antigravity / `agy`**), sub-model, and reasoning effort level.
 
@@ -119,6 +120,8 @@ jroute --json "Analyze the PostgreSQL deadlock issue"
 
 ## JRC Geçidi (tüm botlar/servisler jrc'den geçer)
 
+> **Agensi Eklentisi:** Yönetici katmanı, merkezi geçit ve token defteri modülleri Agensi Marketplace'te [`jroute-cli-manager`](https://agensi.io/skills/jroute-cli-manager) ($1) olarak da paketlenmiştir.
+
 Peribot (openclaw/Peri), geocubot, eretnabot ve Hermes `claude`/`agy` motorunu kendi seçemez.
 Karar tek yerde verilir: `jrc_gate.decide(kaynak, görev)`.
 
@@ -127,3 +130,27 @@ Karar tek yerde verilir: `jrc_gate.decide(kaynak, görev)`.
 - Komutlar: `jrc gate [saat]` · `jrc audit` · `jrc engine auto|claude|agy` · `jrc policy`.
 - Bağlı noktalar (odoo): `maliyet_defteri.claude_calistir`, `argon_gemini_proxy.py` (Hermes+Peri), `hizli_yol.py`.
 - Kota fallback'ini de servis değil jrc yapar (`jrc_gate.fallback`); motor kilitliyse sessiz geçiş yapılmaz.
+
+## Yönetici Katmanı (Fable işi yönetir)
+
+jrc motoru, modeli ve eforu seçtikten sonra işin **nasıl** yapılacağını Fable belirler (`jrc_director.py`):
+
+1. Fable salt-okunur araçlarla (`Read,Grep,Glob`) projeye ve `.jrc_context.md`'ye bakıp yürütücü için bir iş emri yazar.
+2. Seçilen yürütücü (claude/agy) iş emriyle çalışır; `.jrc_context.md`'ye yazmaz, raporunu `~/.cache/jroute/reports/` altına bırakır.
+3. Fable raporu ve değişen dosyaları denetler, `.jrc_context.md` → "Ortak Notlar" satırını yazar.
+
+- Yürütücü zaten Fable ise ek çağrı yapılmaz; Fable hem yönetir hem notu kendi yazar.
+- Fable'a ulaşılamazsa görev eski (yönetimsiz) akışla çalışır. `-d` / `--json` Fable'ı çağırmaz.
+- Yalnızca `jrc` / `jroute` görevlerinde geçerlidir; `jrc_gate.decide()` kullanan botlar/servisler kapsam dışıdır.
+- Aç/kapat: `jrc director on|off`. Ayar: `jrc_policy.json` → `"director": {"enabled", "model", "effort", "timeout_s"}`. Çağrılar geçit defterine `director` kaynağıyla yazılır.
+
+## Token defteri (`jrc tokens`)
+
+`jrc_tokens.py` motor ve model bazında token yakımını kalıcı olarak kaydeder:
+
+- **Kaynak:** Claude Code oturum kayıtlarındaki gerçek `usage` sayaçları (`~/.claude/projects/**/*.jsonl`, alt ajanlar dahil) + maliyet defterindeki agy ve doğrudan API çağrıları.
+- **Kalıcı defter:** `~/.cache/jroute/tokens.db` (SQLite). Claude oturum dosyalarını ~30 günde siler; defter silmez.
+- **Güncelleme:** cron 5 dakikada bir (`jrc_tokens.py --sessiz`) ve her jrc görevinden sonra arka planda.
+- **Pano:** özet `odoo/addons/.jrc_tokens.json` dosyasına yazılır; `eretnastore.com/yonetim#hermes-token` (Hermes → 🔥 Token) okur.
+- **Komut:** `jrc tokens` (terminal raporu), `jrc tokens --json`.
+- "API eşdeğeri $" liste fiyatıyla hesaptır (`PRICES` tablosu); abonelikte ödenmez.

@@ -32,8 +32,11 @@ JEV_SYSTEM_PROMPT = (
     "İzinsiz taşıma/silme/temizlik yapma. Dizin haritası ve kurallar için ~/.claude/CLAUDE.md içindeki JEV bölümüne bak. "
     "Bu projede Git KULLANILMAMAKTADIR. Projenin ortak hafıza katmanı, görev geçmişi, son değişen dosyalar "
     "ve mimari kararlar proje kökündeki '.jrc_context.md' dosyasında tutulur. Göreve başlamadan önce .jrc_context.md "
-    "içeriğini oku, bağlamı koru ve aldığın kritik mimari kararları bu dosyadaki 'Ortak Notlar' bölümüne ekle."
+    "içeriğini oku, bağlamı koru"
 )
+# Yönetimsiz akışta (ya da yürütücü Fable'ın kendisiyken) notu yürütücü yazar;
+# yönetimli akışta bu cümle yerine jrc_director.executor_brief() eklenir.
+JEV_SELF_NOTE_PROMPT = " ve aldığın kritik mimari kararları bu dosyadaki 'Ortak Notlar' bölümüne ekle."
 os.environ["JEV_ORIGIN"] = "1"  # exec/subprocess ile çocuk sürece geçer
 
 DEFAULT_BASE_URL = os.environ.get("TYPESAFE_BASE_URL", "http://127.0.0.1:11435")
@@ -335,8 +338,12 @@ def build_cli_command(
     print_mode: bool = False,
     skip_permissions: bool = False,
     extra_args: list[str] | None = None,
+    brief: str | None = None,
 ) -> list[str]:
-    """Seçilen araç ve alt modele göre çalıştırılacak CLI komut dizisini üretir."""
+    """Seçilen araç ve alt modele göre çalıştırılacak CLI komut dizisini üretir.
+
+    brief: yönetici (Fable) iş emri + hafıza kuralı; verilirse yürütücü notu kendisi yazmaz.
+    """
     tool = decision["tool"]
     model = decision["model"]
     effort = decision["effort"]
@@ -344,7 +351,7 @@ def build_cli_command(
 
     if tool == "claude":
         cmd = ["claude", "--model", model, "--effort", effort,
-               "--append-system-prompt", JEV_SYSTEM_PROMPT]
+               "--append-system-prompt", JEV_SYSTEM_PROMPT + (f".{brief}" if brief else JEV_SELF_NOTE_PROMPT)]
         if skip_permissions:
             cmd.append("--dangerously-skip-permissions")
         if print_mode:
@@ -358,6 +365,8 @@ def build_cli_command(
     if skip_permissions:
         cmd.append("--dangerously-skip-permissions")
     task_payload = task if ".jrc_context.md" in task else f"[Hafıza: .jrc_context.md] {task}"
+    if brief:
+        task_payload += brief
     if print_mode:
         cmd.extend(["-p", task_payload])
     else:
@@ -493,6 +502,22 @@ def main() -> int:
 
     if args.cwd:
         os.chdir(target_cwd)
+
+    import jrc_director
+    if jrc_director.active_for(decision):
+        # jrc motoru/modeli seçti; işin nasıl yapılacağını ve hafıza notunu Fable yönetir.
+        rc = jrc_director.run(
+            task_text, decision, target_cwd, args.print_mode,
+            lambda brief: build_cli_command(
+                decision=decision, task=task_text, print_mode=args.print_mode,
+                skip_permissions=args.skip_permissions, extra_args=unknown, brief=brief,
+            ),
+        )
+        try:
+            jrc_context.sync_workspace_memory(target_cwd)
+        except Exception:
+            pass
+        return rc
 
     os.execvp(cmd[0], cmd)
     return 0

@@ -22,6 +22,7 @@ from typing import Any
 # Aynı klasördeki router.py modülünü içe aktar
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import jrc_context  # noqa: E402
+import jrc_director  # noqa: E402
 import jrc_gate  # noqa: E402
 import jrc_usage  # noqa: E402
 import router  # noqa: E402
@@ -581,10 +582,29 @@ def run_interactive_console(args: argparse.Namespace, extra_args: list[str]) -> 
             pass
 
         os.chdir(target_cwd)
+
+        # jrc motoru/modeli seçti; işin nasıl yapılacağını ve hafıza notunu Fable yönetir.
+        def run_agent(_text: str = text, _decision: dict[str, Any] = decision,
+                      _print: bool = one_shot_print, _cmd: list[str] = cmd) -> None:
+            if not jrc_director.active_for(_decision):
+                subprocess.run(_cmd, cwd=str(target_cwd))
+                return
+            jrc_director.run(
+                _text, _decision, target_cwd, _print,
+                lambda brief: router.build_cli_command(
+                    decision=_decision, task=_text, print_mode=_print,
+                    skip_permissions=skip_permissions, extra_args=extra_args, brief=brief,
+                ),
+            )
+
         if one_shot_print:
             print()
-            subprocess.run(cmd, cwd=str(target_cwd))
+            try:
+                run_agent()
+            except KeyboardInterrupt:
+                print()
             print()
+            _refresh_tokens_bg()
             try:
                 jrc_context.sync_workspace_memory(target_cwd)
             except Exception:
@@ -601,7 +621,7 @@ def run_interactive_console(args: argparse.Namespace, extra_args: list[str]) -> 
             pass
 
         try:
-            subprocess.run(cmd, cwd=str(target_cwd))
+            run_agent()
         except KeyboardInterrupt:
             print()
         finally:
@@ -612,6 +632,7 @@ def run_interactive_console(args: argparse.Namespace, extra_args: list[str]) -> 
                 except Exception:
                     pass
 
+        _refresh_tokens_bg()
         try:
             jrc_context.sync_workspace_memory(target_cwd)
             print("\n\033[32m✓ Ajan oturumu tamamlandı. .jrc_context.md hafızası güncellendi.\033[0m\n")
@@ -622,8 +643,19 @@ def run_interactive_console(args: argparse.Namespace, extra_args: list[str]) -> 
     return 0
 
 
+def _refresh_tokens_bg() -> None:
+    """Görev bitince token defterini (jrc_tokens) arka planda günceller; panel beklemeden güncel kalır."""
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve().parent / "jrc_tokens.py"), "--sessiz"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+    except Exception:
+        pass
+
+
 def run_gate_command(name: str, rest: list[str]) -> int:
-    """`jrc gate|audit|engine|policy` — bot/servis çağrılarının jrc geçidi kontrolü."""
+    """`jrc gate|audit|engine|director|policy` — bot/servis çağrılarının jrc geçidi kontrolü."""
     bold, dim, green, yellow, red, reset = "\033[1m", "\033[2m", "\033[32m", "\033[33m", "\033[31m", "\033[0m"
     if name == "engine":
         if rest:
@@ -631,6 +663,14 @@ def run_gate_command(name: str, rest: list[str]) -> int:
             print(f"{green}✓ Motor kilidi: {eng}{reset}")
         else:
             print(f"Motor kilidi: {jrc_gate.load_policy().get('engine', 'auto')}  (kullanım: jrc engine auto|claude|agy)")
+        return 0
+    if name == "director":
+        if rest and rest[0].lower() in ("on", "off", "aç", "ac", "kapat"):
+            jrc_director.set_enabled(rest[0].lower() in ("on", "aç", "ac"))
+        cfg = jrc_director.config()
+        durum = f"{green}açık{reset}" if cfg.get("enabled") else f"{red}kapalı{reset}"
+        print(f"Yönetici: {durum} · model {cfg['model']} · efor {cfg['effort']} · zaman aşımı {cfg['timeout_s']} sn"
+              f"  {dim}(kullanım: jrc director on|off){reset}")
         return 0
     if name == "policy":
         print(json.dumps(jrc_gate.load_policy(), ensure_ascii=False, indent=2))
@@ -655,7 +695,7 @@ def run_gate_command(name: str, rest: list[str]) -> int:
         print(f"  ├─ {bold}{src:<14}{reset} {dim}{'pin:' + pin if pin else 'analiz'}{reset}  {dist}")
     if not sm["by_source"]:
         print(f"  └─ {dim}henüz kayıt yok ({jrc_gate.LEDGER_FILE}){reset}")
-    print(f"{dim}Komutlar: jrc gate [saat] · jrc audit · jrc engine auto|claude|agy · jrc policy{reset}\n")
+    print(f"{dim}Komutlar: jrc gate [saat] · jrc audit · jrc engine auto|claude|agy · jrc director on|off · jrc policy{reset}\n")
     return 0
 
 
@@ -716,8 +756,11 @@ def main() -> int:
     )
 
     args, unknown = parser.parse_known_args()
-    if unknown and unknown[0].lower() in ("gate", "audit", "engine", "policy"):
+    if unknown and unknown[0].lower() in ("gate", "audit", "engine", "director", "policy"):
         return run_gate_command(unknown[0].lower(), unknown[1:])
+    if unknown and unknown[0].lower() in ("tokens", "token"):
+        import jrc_tokens
+        return jrc_tokens.main(unknown[1:] + (["--json"] if args.json else []))
     if unknown and unknown[0].lower() == "usage":
         target_cwd = Path(args.cwd).resolve() if args.cwd else Path.cwd()
         jrc_usage.print_usage_report(target_cwd, as_json=args.json)

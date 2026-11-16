@@ -50,6 +50,12 @@
       "pin": "agy_carbon",
       "effort": "low",
       "max_effort": "high"
+    },
+    "keabilgisayar_yazar": {
+      "pin": "claude_fable",
+      "effort": "high",
+      "max_effort": "high",
+      "allow_tools": ["claude"]
     }
   }
 }
