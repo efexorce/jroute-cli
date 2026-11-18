@@ -11,3 +11,5 @@ projeler/
 *.bak-*
 .venv.py312.bak/
 jroute-cli-agensi.zip
+artifacts/
+

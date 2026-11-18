@@ -21,6 +21,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -130,16 +131,63 @@ def _user_text(msg: Any) -> str:
     texts = [c] if isinstance(c, str) else [
         b.get("text", "") for b in (c or []) if isinstance(b, dict) and b.get("type") == "text"
     ]
-    for t in texts:
-        t = " ".join(str(t).split())
+    for raw in texts:
+        s = str(raw)
+        m = re.search(r"<gorev>\s*(.*?)\s*</gorev>", s, re.S)
+        if m:
+            inner = " ".join(m.group(1).split())
+            if inner:
+                return ("🧭 " + inner)[:140]
+        t = " ".join(s.split())
         if t and not t.startswith("<") and not t.startswith("Caveat:"):
             return t[:140]
     return ""
 
 
+def _fix_director_titles(con: sqlite3.Connection) -> None:
+    """Eski yönetici oturumlarının kalıp başlıklarını bir kez silip jsonl'den gerçek <gorev> başlığıyla yeniler."""
+    if con.execute("SELECT v FROM meta WHERE k='baslik_fix_v1'").fetchone():
+        return
+    bad = {
+        r[0]
+        for r in con.execute("SELECT session FROM sess WHERE title LIKE 'Sen JEV iş akışının yöneticisisin%'")
+    }
+    titles: list[tuple[str, str]] = []
+    if bad and CLAUDE_PROJECTS.is_dir():
+        for path in CLAUDE_PROJECTS.rglob("*.jsonl"):
+            if not bad:
+                break
+            try:
+                with path.open("rb") as fh:
+                    for raw in fh:
+                        if b'"usage"' in raw or b'"type":"user"' not in raw:
+                            continue
+                        try:
+                            obj = json.loads(raw)
+                        except Exception:
+                            continue
+                        if obj.get("type") != "user" or obj.get("isSidechain") or obj.get("isMeta"):
+                            continue
+                        session = str(obj.get("sessionId") or obj.get("session_id") or path.stem)
+                        if session not in bad:
+                            continue
+                        t = _user_text(obj.get("message"))
+                        if t:
+                            titles.append((session, t))
+                            bad.discard(session)
+            except OSError:
+                continue
+    with con:
+        con.execute("DELETE FROM sess WHERE title LIKE 'Sen JEV iş akışının yöneticisisin%'")
+        if titles:
+            con.executemany("INSERT OR IGNORE INTO sess (session, title) VALUES (?,?)", titles)
+        con.execute("INSERT OR REPLACE INTO meta (k, v) VALUES ('baslik_fix_v1', '1')")
+
+
 def _scan_claude(con: sqlite3.Connection) -> int:
     if not CLAUDE_PROJECTS.is_dir():
         return 0
+    _fix_director_titles(con)
     offsets = dict(con.execute("SELECT path, offset FROM files"))
     titled = {r[0] for r in con.execute("SELECT session FROM sess")}
     added = 0

@@ -92,6 +92,20 @@ TOKEN_FILE = CACHE_DIR / "web_token"
 WEB_JOBS_DIR = CACHE_DIR / "web_jobs"
 STATE_FILE = CACHE_DIR / "web_state.json"
 
+IMAGE_ALLOWED_ROOTS: tuple[str, ...] = (
+    "/home/efe/Desktop/jev/artifacts",
+    "/home/efe/Desktop/jev/projeler",
+    "/home/efe/Desktop/projeler",
+    str(Path(DEFAULT_CWD).resolve() / "artifacts"),
+)
+IMAGE_MIME_TYPES: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\r")
 DIRECTOR_ORDER_RE = re.compile(
     r"🎬 Yönetici \([^)]+\):[^\n]*iş emri hazırlanıyor[^\n]*\n\x1b\[2m[\s\S]*?\x1b\[0m\r?\n+"
@@ -758,6 +772,99 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       font-weight: 600;
       margin-top: 4px;
     }
+    .res-gallery {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .res-thumb-card {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      width: 154px;
+      padding: 7px;
+      background: var(--panel-alt);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      cursor: zoom-in;
+      color: var(--text);
+      font-family: inherit;
+      transition: border-color 0.15s, transform 0.15s;
+    }
+    .res-thumb-card:hover {
+      border-color: var(--accent);
+      transform: translateY(-1px);
+    }
+    .res-thumb-img {
+      width: 100%;
+      height: 168px;
+      object-fit: cover;
+      border-radius: 5px;
+      background: #090d11;
+      display: block;
+    }
+    .res-thumb-cap {
+      width: 100%;
+      font-size: 11px;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      text-align: center;
+    }
+    .img-lightbox {
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      background: rgba(5, 8, 13, 0.9);
+      backdrop-filter: blur(4px);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 24px;
+      cursor: zoom-out;
+    }
+    .img-lightbox-close {
+      position: fixed;
+      top: 16px;
+      right: 20px;
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 12px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .img-lightbox-close:hover {
+      border-color: var(--accent);
+    }
+    .img-lightbox-img {
+      max-width: min(92vw, 1100px);
+      max-height: calc(100vh - 96px);
+      object-fit: contain;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      box-shadow: 0 18px 50px rgba(0, 0, 0, 0.7);
+      cursor: default;
+      background: #090d11;
+    }
+    .img-lightbox-cap {
+      max-width: 90vw;
+      font-size: 12px;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      cursor: default;
+    }
     /* Sekme navigasyonu ve Token Harcama paneli */
     .nav-tabs {
       display: inline-flex;
@@ -1403,8 +1510,117 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       }
       frag.appendChild(bodyDiv);
 
+      const imgPaths = extractImagePaths(resultText);
+      if (imgPaths.length) {
+        const galleryDiv = document.createElement('div');
+        galleryDiv.className = 'res-gallery';
+        for (const imgPath of imgPaths) {
+          const cardBtn = document.createElement('button');
+          cardBtn.type = 'button';
+          cardBtn.className = 'res-thumb-card';
+          cardBtn.title = imgPath + ' (Büyütmek için tıklayın)';
+
+          const imgUrl = '/api/image?path=' + encodeURIComponent(imgPath);
+          const fileName = imgPath.split('/').pop() || imgPath;
+
+          const imgEl = document.createElement('img');
+          imgEl.className = 'res-thumb-img';
+          imgEl.src = imgUrl;
+          imgEl.alt = fileName;
+          imgEl.loading = 'lazy';
+          imgEl.addEventListener('error', () => {
+            cardBtn.remove();
+            if (!galleryDiv.childElementCount) {
+              galleryDiv.remove();
+            }
+          });
+
+          const capEl = document.createElement('span');
+          capEl.className = 'res-thumb-cap';
+          capEl.textContent = '🔍 ' + fileName;
+
+          cardBtn.appendChild(imgEl);
+          cardBtn.appendChild(capEl);
+          cardBtn.addEventListener('click', () => openImageLightbox(imgUrl, imgPath));
+          galleryDiv.appendChild(cardBtn);
+        }
+        frag.appendChild(galleryDiv);
+      }
+
       resultContent.replaceChildren(frag);
     }
+
+    function extractImagePaths(text) {
+      if (!text) return [];
+      const re = /(?:^|[\\s"'`([<=]|file:\\/\\/)(\\/[A-Za-z0-9_][^\\s"'`<>()\\[\\]*?]*\\.(?:png|jpe?g|webp|gif))/gi;
+      const seen = new Set();
+      const paths = [];
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        let p = m[1];
+        try { p = decodeURIComponent(p); } catch (e) {}
+        if (!seen.has(p)) {
+          seen.add(p);
+          paths.push(p);
+        }
+      }
+      return paths;
+    }
+
+    let activeLightboxEl = null;
+
+    function closeImageLightbox() {
+      if (activeLightboxEl) {
+        activeLightboxEl.remove();
+        activeLightboxEl = null;
+      }
+    }
+
+    function openImageLightbox(imgUrl, filePath) {
+      closeImageLightbox();
+      const overlay = document.createElement('div');
+      overlay.className = 'img-lightbox';
+      overlay.setAttribute('role', 'dialog');
+      overlay.setAttribute('aria-modal', 'true');
+
+      const closeBtn = document.createElement('button');
+      closeBtn.type = 'button';
+      closeBtn.className = 'img-lightbox-close';
+      closeBtn.textContent = '✕ Kapat (ESC)';
+      closeBtn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        closeImageLightbox();
+      });
+
+      const fullImg = document.createElement('img');
+      fullImg.className = 'img-lightbox-img';
+      fullImg.src = imgUrl;
+      fullImg.alt = filePath.split('/').pop() || filePath;
+      fullImg.addEventListener('click', (ev) => ev.stopPropagation());
+
+      const cap = document.createElement('div');
+      cap.className = 'img-lightbox-cap';
+      cap.textContent = filePath;
+      cap.addEventListener('click', (ev) => ev.stopPropagation());
+
+      overlay.appendChild(closeBtn);
+      overlay.appendChild(fullImg);
+      overlay.appendChild(cap);
+      overlay.addEventListener('click', (ev) => {
+        if (ev.target === overlay) {
+          closeImageLightbox();
+        }
+      });
+
+      document.body.appendChild(overlay);
+      activeLightboxEl = overlay;
+    }
+
+    document.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape' && activeLightboxEl) {
+        closeImageLightbox();
+      }
+    });
 
     async function pollJob(jobId) {
       if (pollTimer) clearTimeout(pollTimer);
@@ -1849,6 +2065,54 @@ class JRCWebHandler(BaseHTTPRequestHandler):
 
         if not self._check_auth():
             self._send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "Yetkisiz istek (geçersiz web_token)."})
+            return
+
+        if path == "/api/image":
+            qs = urllib.parse.parse_qs(parsed.query)
+            raw_img_path = (qs.get("path", [""])[0] or "").strip()
+            if raw_img_path.startswith("file://"):
+                raw_img_path = urllib.parse.unquote(raw_img_path[7:])
+            if not raw_img_path or not raw_img_path.startswith("/"):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Geçersiz görsel yolu."})
+                return
+
+            real_target = os.path.realpath(raw_img_path)
+            allowed_reals = [os.path.realpath(r) for r in IMAGE_ALLOWED_ROOTS if r]
+            in_allowed = False
+            for root_real in allowed_reals:
+                try:
+                    if os.path.commonpath([real_target, root_real]) == root_real and real_target != root_real:
+                        in_allowed = True
+                        break
+                except ValueError:
+                    continue
+            if not in_allowed:
+                self._send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "İzinli kök dizin dışında erişim engellendi."})
+                return
+
+            ext = os.path.splitext(real_target)[1].lower()
+            mime = IMAGE_MIME_TYPES.get(ext)
+            if not mime:
+                self._send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "Yalnızca görsel uzantılarına (png/jpg/jpeg/webp/gif) izin verilir."})
+                return
+
+            if not os.path.isfile(real_target):
+                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Görsel dosyası bulunamadı."})
+                return
+
+            try:
+                img_bytes = Path(real_target).read_bytes()
+            except OSError:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "Görsel okunamadı."})
+                return
+
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(img_bytes)))
+            self.send_header("Cache-Control", "private, max-age=5")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(img_bytes)
             return
 
         if path == "/api/jobs":
