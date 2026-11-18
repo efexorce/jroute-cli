@@ -35,6 +35,8 @@ import jrc  # noqa: E402
 import jrc_context  # noqa: E402
 import jrc_director  # noqa: E402
 import jrc_gate  # noqa: E402
+import jrc_tokens  # noqa: E402
+import jrc_usage  # noqa: E402
 import router  # noqa: E402
 import stat as _stat  # noqa: E402
 
@@ -83,7 +85,7 @@ jrc_context.scan_project_files = _safe_scan_project_files
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
-DEFAULT_CWD = str(Path.home() / "Desktop" / "jev" / "projeler")
+DEFAULT_CWD = os.environ.get("JRC_WEB_CWD") or str(Path(__file__).resolve().parent)
 
 CACHE_DIR = Path.home() / ".cache" / "jroute"
 TOKEN_FILE = CACHE_DIR / "web_token"
@@ -91,10 +93,33 @@ WEB_JOBS_DIR = CACHE_DIR / "web_jobs"
 STATE_FILE = CACHE_DIR / "web_state.json"
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\r")
+DIRECTOR_ORDER_RE = re.compile(
+    r"🎬 Yönetici \([^)]+\):[^\n]*iş emri hazırlanıyor[^\n]*\n\x1b\[2m[\s\S]*?\x1b\[0m\r?\n+"
+)
+ROUTER_CMD_RE = re.compile(r"^\s*└─ Komut\s*:[^\n]*\n+", flags=re.MULTILINE)
 
 
 def strip_ansi(text: str) -> str:
     return ANSI_RE.sub("", text)
+
+
+def extract_result_section(raw_text: str, dry_run: bool = False) -> str:
+    """Çıktının son anlamlı bölümünü (ajanın nihai yanıtını) ayıklar."""
+    if not raw_text or not raw_text.strip():
+        return ""
+    if dry_run:
+        return strip_ansi(raw_text).strip()
+    m_dir = DIRECTOR_ORDER_RE.search(raw_text)
+    if m_dir:
+        return strip_ansi(raw_text[m_dir.end():]).strip()
+    clean = strip_ansi(raw_text)
+    m_cmd = ROUTER_CMD_RE.search(clean)
+    if m_cmd:
+        tail = clean[m_cmd.end():].strip()
+        if tail:
+            return tail
+    lines = clean.strip().splitlines()
+    return "\n".join(lines[-40:])
 
 
 def ensure_token() -> str:
@@ -657,6 +682,343 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       color: var(--muted);
       font-size: 11px;
     }
+    .col-mid {
+      min-width: 0;
+    }
+    .res-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .res-task {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+      background: var(--panel-alt);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+      margin-bottom: 8px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 96px;
+      overflow-y: auto;
+    }
+    .res-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .res-body {
+      background: #090d11;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      max-height: 520px;
+      overflow-y: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12.5px;
+      line-height: 1.5;
+    }
+    .res-line {
+      white-space: pre-wrap;
+      word-break: break-word;
+      padding: 1px 6px;
+      border-radius: 4px;
+      color: var(--text);
+    }
+    .res-line.res-empty {
+      min-height: 8px;
+      padding: 0;
+    }
+    .res-line.res-green {
+      color: var(--green);
+      background: rgba(63, 185, 80, 0.08);
+      border-left: 2px solid var(--green);
+    }
+    .res-line.res-red {
+      color: var(--red);
+      background: rgba(248, 81, 73, 0.1);
+      border-left: 2px solid var(--red);
+    }
+    .res-line.res-yellow {
+      color: var(--yellow);
+      background: rgba(210, 153, 34, 0.08);
+      border-left: 2px solid var(--yellow);
+    }
+    .res-line.res-muted {
+      color: var(--muted);
+    }
+      .res-line.res-heading {
+      color: var(--accent);
+      font-weight: 600;
+      margin-top: 4px;
+    }
+    /* Sekme navigasyonu ve Token Harcama paneli */
+    .nav-tabs {
+      display: inline-flex;
+      gap: 6px;
+      background: var(--panel);
+      padding: 4px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+    }
+    .nav-tab {
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid transparent;
+      border-radius: 7px;
+      padding: 6px 14px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-family: inherit;
+    }
+    .nav-tab:hover {
+      color: var(--text);
+    }
+    .nav-tab.active {
+      background: var(--panel-alt);
+      color: var(--text);
+      border-color: var(--accent);
+    }
+    .tk-donem, .tk-olcu {
+      display: inline-flex;
+      gap: 5px;
+      flex-wrap: wrap;
+    }
+    .tk-donem button, .tk-olcu button {
+      border: 1px solid var(--border);
+      background: var(--panel-alt);
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 12px;
+      padding: 5px 11px;
+      border-radius: 7px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .tk-donem button:hover, .tk-olcu button:hover {
+      color: var(--text);
+      border-color: var(--accent);
+    }
+    .tk-donem button.aktif, .tk-olcu button.aktif {
+      background: rgba(88, 166, 255, 0.16);
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .tk-kpi {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(165px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .tk-kpi .kutu {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 11px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .tk-kpi .kutu small {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .tk-kpi .kutu b {
+      font-size: 21px;
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+    }
+    .tk-motorlar {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .tk-motor {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+    }
+    .tk-motor h4 {
+      margin: 0 0 4px;
+      font-size: 13px;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .tk-motor b {
+      font-size: 22px;
+      color: var(--text);
+      display: block;
+      font-variant-numeric: tabular-nums;
+    }
+    .tk-motor small {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .tk-pay {
+      height: 6px;
+      background: var(--bg);
+      border-radius: 3px;
+      overflow: hidden;
+      margin: 6px 0 4px;
+    }
+    .tk-pay i {
+      display: block;
+      height: 100%;
+      background: var(--accent);
+      border-radius: 3px;
+    }
+    .tk-card-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+    .tk-card-head h3 {
+      margin: 0;
+      font-size: 14px;
+      color: var(--text);
+    }
+    .tk-kaydir {
+      overflow-x: auto;
+    }
+    .tk-tablo {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    .tk-tablo th {
+      font-size: 12px;
+      white-space: nowrap;
+      text-align: left;
+      color: var(--muted);
+      padding: 7px 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    .tk-tablo td {
+      padding: 7px 8px;
+      border-bottom: 1px solid rgba(48, 54, 61, 0.55);
+      color: var(--text);
+    }
+    .tk-tablo tr:last-child td {
+      border-bottom: 0;
+    }
+    .tk-tablo td.s, .tk-tablo th.s {
+      text-align: right;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+    .tk-tablo td.pay {
+      min-width: 90px;
+    }
+    .tk-tablo td.baslik {
+      max-width: 380px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .tk-nokta {
+      display: inline-block;
+      width: 9px;
+      height: 9px;
+      border-radius: 2px;
+      margin-right: 6px;
+      vertical-align: baseline;
+    }
+    .tk-grafik {
+      display: flex;
+      align-items: flex-end;
+      gap: 3px;
+      height: 170px;
+      padding-top: 18px;
+      border-bottom: 1px solid var(--border);
+    }
+    .tk-sutun {
+      flex: 1;
+      min-width: 6px;
+      height: 100%;
+      display: flex;
+      flex-direction: column-reverse;
+      position: relative;
+      cursor: default;
+    }
+    .tk-sutun i {
+      display: block;
+      width: 100%;
+    }
+    .tk-sutun i:last-child {
+      border-radius: 3px 3px 0 0;
+    }
+    .tk-sutun:hover {
+      filter: brightness(1.18);
+    }
+    .tk-eksen {
+      display: flex;
+      gap: 3px;
+      margin-top: 3px;
+    }
+    .tk-eksen span {
+      flex: 1;
+      min-width: 6px;
+      text-align: center;
+      font-size: 10px;
+      color: var(--muted);
+      overflow: hidden;
+      white-space: nowrap;
+    }
+    .tk-lejant {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 8px;
+    }
+    .tk-izgara {
+      display: grid;
+      grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
+    @media (max-width: 900px) {
+      .tk-izgara { grid-template-columns: 1fr; }
+    }
+    .hm-satir {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 6px 0;
+      border-bottom: 1px dashed var(--border);
+      font-size: 13px;
+    }
+    .hm-satir:last-child {
+      border-bottom: 0;
+    }
+    .hm-satir span:first-child {
+      color: var(--muted);
+    }
+    .tk-not {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.5;
+      margin: 4px 0 10px;
+    }
   </style>
 </head>
 <body>
@@ -666,10 +1028,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <h1>⚡ JRC Web Konsolu <span class="badge cyan">127.0.0.1</span></h1>
         <div class="sub">Görevleri tarayıcıdan Jev Router &amp; Yönetici (Director) akışına gönderin</div>
       </div>
-      <div id="statusBadge" class="badge">Hazır</div>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <div class="nav-tabs" id="mainTabs">
+          <button type="button" class="nav-tab active" data-tab="console">⚡ Görev Konsolu</button>
+          <button type="button" class="nav-tab" data-tab="tokens">🔥 Token Harcama <span id="tabTokenBadge" class="badge yellow" style="display:none;font-size:11px;padding:1px 6px;"></span></button>
+        </div>
+        <div id="statusBadge" class="badge">Hazır</div>
+      </div>
     </header>
 
-    <div class="grid">
+    <div id="consolePanel" class="grid">
       <div class="card">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
           <strong style="font-size:14px;">Geçmiş Görevler</strong>
@@ -680,42 +1048,43 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
       </div>
 
-      <form id="runForm" class="card">
-        <div>
-          <label for="task">Görev / Prompt <span class="sub">(Ctrl+Enter ile gönder)</span></label>
-          <textarea id="task" name="task" placeholder="Yapılacak işi yazın (örn. merhaba dünya dosyası oluştur)..." required></textarea>
-        </div>
-
-        <div class="row">
+      <div class="col-mid">
+        <form id="runForm" class="card">
           <div>
-            <label for="cwd">Çalışma Dizini (cwd)</label>
-            <input type="text" id="cwd" name="cwd" value="__DEFAULT_CWD__" required />
-            <div class="chips">
-              <span class="chip" data-cwd="~/Desktop/jev/projeler">~/Desktop/jev/projeler</span>
-              <span class="chip" data-cwd="~/Desktop/jev">~/Desktop/jev</span>
-              <span class="chip" data-cwd="~/Desktop/jev/projeler/odoo">~/Desktop/jev/projeler/odoo</span>
-              <span class="chip" data-cwd="~/Desktop/jev/projeler/Webler">~/Desktop/jev/projeler/Webler</span>
-              <span class="chip" data-cwd="/tmp">/tmp</span>
+            <label for="task">Görev / Prompt <span class="sub">(Ctrl+Enter ile gönder)</span></label>
+            <textarea id="task" name="task" placeholder="Yapılacak işi yazın (örn. merhaba dünya dosyası oluştur)..." required></textarea>
+          </div>
+
+          <div class="row">
+            <div>
+              <label for="tool">Araç Seçimi</label>
+              <select id="tool" name="tool">
+                <option value="auto">Otomatik (Jev seçer)</option>
+                <option value="claude">Claude Code (claude)</option>
+                <option value="agy">Antigravity (agy)</option>
+              </select>
             </div>
           </div>
-          <div>
-            <label for="tool">Araç Seçimi</label>
-            <select id="tool" name="tool">
-              <option value="auto">Otomatik (Jev seçer)</option>
-              <option value="claude">Claude Code (claude)</option>
-              <option value="agy">Antigravity (agy)</option>
-            </select>
+
+          <div class="actions">
+            <label class="check-label">
+              <input type="checkbox" id="dryRun" name="dry_run" />
+              Dry-run (yalnızca karar testi, komutu çalıştırma)
+            </label>
+            <button type="submit" id="submitBtn" class="primary">🚀 Gönder</button>
+          </div>
+        </form>
+
+        <div id="resultBox" class="card">
+          <div class="res-header">
+            <strong style="font-size:14px;">İşlem Sonucu</strong>
+            <span id="resultStatusBadge" class="badge" style="display:none;"></span>
+          </div>
+          <div id="resultContent">
+            <div class="sub">Henüz sonuç yok.</div>
           </div>
         </div>
-
-        <div class="actions">
-          <label class="check-label">
-            <input type="checkbox" id="dryRun" name="dry_run" />
-            Dry-run (yalnızca karar testi, komutu çalıştırma)
-          </label>
-          <button type="submit" id="submitBtn" class="primary">🚀 Gönder</button>
-        </div>
-      </form>
+      </div>
 
       <div class="card">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
@@ -730,14 +1099,82 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <pre id="output">Henüz görev başlatılmadı.</pre>
       </div>
     </div>
+
+    <section id="tokenPanel" style="display:none;">
+      <div class="card" style="margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;padding:12px 16px;">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+          <strong style="font-size:15px;">🔥 Token Harcama &amp; Maliyet Defteri</strong>
+          <div class="tk-donem" id="tkDonem">
+            <button type="button" data-d="5s">Son 5 saat</button>
+            <button type="button" data-d="bugun" class="aktif">Bugün</button>
+            <button type="button" data-d="7g">7 gün</button>
+            <button type="button" data-d="30g">30 gün</button>
+            <button type="button" data-d="tum">Tümü</button>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="badge" id="tkYas"></span>
+          <button type="button" id="tkYenile" class="chip" style="padding:5px 10px;font-size:12px;">↻ Yenile</button>
+        </div>
+      </div>
+
+      <div class="tk-kpi" id="tkKpi"></div>
+      <div class="tk-motorlar" id="tkMotorlar"></div>
+
+      <div class="card">
+        <div class="tk-card-head">
+          <h3>Model bazında yakım</h3>
+          <span class="badge cyan" id="tkModelRozet"></span>
+        </div>
+        <div class="tk-kaydir" id="tkModeller"></div>
+      </div>
+
+      <div class="card">
+        <div class="tk-card-head">
+          <h3>Günlük yakım · son 30 gün</h3>
+          <div class="tk-olcu" id="tkOlcu">
+            <button type="button" data-o="toplam" class="aktif">Toplam token</button>
+            <button type="button" data-o="cikti">Çıktı token</button>
+            <button type="button" data-o="usd">API eşdeğeri $</button>
+          </div>
+        </div>
+        <div id="tkGrafik"></div>
+      </div>
+
+      <div class="tk-izgara">
+        <div>
+          <div class="card">
+            <div class="tk-card-head">
+              <h3>Son oturumlar (Claude)</h3>
+              <span class="badge" id="tkOturumRozet"></span>
+            </div>
+            <div class="tk-kaydir" id="tkOturumlar"></div>
+          </div>
+        </div>
+        <div>
+          <div class="card">
+            <div class="tk-card-head">
+              <h3>Kaynak / proje</h3>
+            </div>
+            <div class="tk-kaydir" id="tkKaynaklar"></div>
+          </div>
+          <div class="card">
+            <div class="tk-card-head">
+              <h3>Antigravity (agy) kotası</h3>
+            </div>
+            <div id="tkKota"></div>
+          </div>
+        </div>
+      </div>
+
+      <p class="tk-not" id="tkNot"></p>
+    </section>
   </div>
 
   <script>
     const JRC_TOKEN = __JRC_TOKEN_JSON__;
-    const SERVER_LAST_CWD = __LAST_CWD_JSON__;
 
     const taskEl = document.getElementById('task');
-    const cwdEl = document.getElementById('cwd');
     const toolEl = document.getElementById('tool');
     const dryRunEl = document.getElementById('dryRun');
     const submitBtn = document.getElementById('submitBtn');
@@ -747,25 +1184,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     const statusBadge = document.getElementById('statusBadge');
     const jobTimer = document.getElementById('jobTimer');
     const jobListEl = document.getElementById('jobList');
+    const resultStatusBadge = document.getElementById('resultStatusBadge');
+    const resultContent = document.getElementById('resultContent');
 
     let activeJobId = null;
     let pollTimer = null;
     let startTimeMs = null;
-
-    // Son kullanılan cwd'yi hatırla
-    const savedCwd = localStorage.getItem('jrc_web_last_cwd');
-    if (savedCwd) {
-      cwdEl.value = savedCwd;
-    } else if (SERVER_LAST_CWD) {
-      cwdEl.value = SERVER_LAST_CWD;
-    }
-
-    document.querySelectorAll('.chip[data-cwd]').forEach(chip => {
-      chip.addEventListener('click', () => {
-        cwdEl.value = chip.getAttribute('data-cwd');
-        localStorage.setItem('jrc_web_last_cwd', cwdEl.value);
-      });
-    });
 
     taskEl.addEventListener('keydown', (e) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
@@ -829,6 +1253,159 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       }
     }
 
+    function extractResultText(data) {
+      if (typeof data.result_output === 'string' && data.result_output.trim() !== '') {
+        return data.result_output.trim();
+      }
+      if (data.status === 'queued') {
+        return `🕒 Sırada bekliyor (#${data.queue_pos || '?'}). Önceki görev bitince otomatik başlayacak.`;
+      }
+      const raw = (data.output || '').trim();
+      if (data.status === 'cancelled' && !raw) {
+        return '⊘ Sıradan çıkarıldı (iptal).';
+      }
+      if (data.status === 'running') {
+        if (raw.includes('iş emri hazırlanıyor')) {
+          return '⏳ İş emri hazırlandı, yürütücü ajan çalışıyor...';
+        }
+        if (!raw) {
+          return '⏳ Çıktı bekleniyor...';
+        }
+      }
+      if (!raw) {
+        return '(Çıktı yok)';
+      }
+      if (data.dry_run) {
+        return raw;
+      }
+      const cmdMatch = raw.match(/^\\s*└─ Komut\\s*:[^\\n]*\\n+/m);
+      if (cmdMatch) {
+        const idx = cmdMatch.index + cmdMatch[0].length;
+        const tail = raw.slice(idx).trim();
+        if (tail) {
+          const tailLines = tail.split('\\n');
+          return tailLines.length > 40 ? tailLines.slice(-40).join('\\n') : tail;
+        }
+      }
+      const lines = raw.split('\\n');
+      return lines.slice(-40).join('\\n');
+    }
+
+    function classifyResultLine(line) {
+      const t = line.trim();
+      if (!t) return 'res-empty';
+      if (
+        t.includes('✗') ||
+        /^(traceback\\b|error:|hata:|exception\\b)/i.test(t) ||
+        /\\b(traceback|syntaxerror|typeerror|valueerror|runtimeerror)\\b/i.test(t)
+      ) {
+        return 'res-red';
+      }
+      if (t.includes('✓') || t.includes('✅')) {
+        return 'res-green';
+      }
+      if (t.includes('⚠') || t.includes('⊘') || /(^|\\s)(uyarı|warning)(\\s|:|,|\\.|$)/i.test(t)) {
+        return 'res-yellow';
+      }
+      if (t.includes('├─') || t.includes('└─') || t.startsWith('│') || t.startsWith('🎬')) {
+        return 'res-muted';
+      }
+      if (
+        !/(0\\s+(js\\s+)?hata|hatasız|no\\s+error|0\\s+error)/i.test(t) &&
+        /(^|\\s)(hata|error|başarısız)(\\s|:|,|\\.|$)/i.test(t)
+      ) {
+        return 'res-red';
+      }
+      if (/(^|\\s)(başarılı|başarı|tamamlandı)(\\s|:|,|\\.|!|$)/i.test(t)) {
+        return 'res-green';
+      }
+      if (/^#{1,4}\\s+/.test(t) || t.startsWith('⚡')) {
+        return 'res-heading';
+      }
+      return '';
+    }
+
+    function renderResult(data) {
+      if (!data) {
+        resultStatusBadge.style.display = 'none';
+        const empty = document.createElement('div');
+        empty.className = 'sub';
+        empty.textContent = 'Henüz sonuç yok.';
+        resultContent.replaceChildren(empty);
+        return;
+      }
+
+      resultStatusBadge.style.display = 'inline-flex';
+      if (data.status === 'done') {
+        resultStatusBadge.className = 'badge green';
+        resultStatusBadge.textContent = '✓ Tamamlandı';
+      } else if (data.status === 'error') {
+        resultStatusBadge.className = 'badge red';
+        resultStatusBadge.textContent = `✗ Hata (kod: ${data.exit_code ?? 1})`;
+      } else if (data.status === 'running') {
+        resultStatusBadge.className = 'badge yellow';
+        resultStatusBadge.textContent = '⏳ Çalışıyor';
+      } else if (data.status === 'queued') {
+        resultStatusBadge.className = 'badge purple';
+        resultStatusBadge.textContent = data.queue_pos ? `🕒 Sırada (#${data.queue_pos})` : '🕒 Sırada';
+      } else if (data.status === 'cancelled') {
+        resultStatusBadge.className = 'badge';
+        resultStatusBadge.textContent = '⊘ İptal edildi';
+      } else {
+        resultStatusBadge.className = 'badge';
+        resultStatusBadge.textContent = data.status || 'Hazır';
+      }
+
+      const frag = document.createDocumentFragment();
+
+      const taskDiv = document.createElement('div');
+      taskDiv.className = 'res-task';
+      taskDiv.textContent = (data.dry_run ? '[DRY-RUN] ' : '') + (data.task || '—');
+      frag.appendChild(taskDiv);
+
+      const metaDiv = document.createElement('div');
+      metaDiv.className = 'res-meta';
+      const dec = data.decision;
+      const modelTag = dec ? `${dec.tool}:${dec.model}` : (data.tool || 'auto');
+      const modelCls = dec ? (dec.tool === 'claude' ? 'green' : 'cyan') : '';
+      const exitDefined = data.exit_code !== null && data.exit_code !== undefined;
+      const exitCls = exitDefined ? (data.exit_code === 0 ? 'green' : 'red') : '';
+      const metaBadges = [
+        { text: modelTag, cls: modelCls },
+        { text: exitDefined ? `Çıkış: ${data.exit_code}` : 'Çıkış: —', cls: exitCls },
+      ];
+      if (data.created_at) {
+        metaBadges.push({ text: `Oluşturma: ${data.created_at}`, cls: '' });
+      }
+      if (data.finished_at) {
+        metaBadges.push({ text: `Bitiş: ${data.finished_at}`, cls: '' });
+      }
+      for (const b of metaBadges) {
+        const sp = document.createElement('span');
+        sp.className = 'badge' + (b.cls ? ' ' + b.cls : '');
+        sp.textContent = b.text;
+        metaDiv.appendChild(sp);
+      }
+      frag.appendChild(metaDiv);
+
+      const bodyDiv = document.createElement('div');
+      bodyDiv.className = 'res-body';
+      const resultText = extractResultText(data);
+      const lines = resultText.split('\\n');
+      for (const line of lines) {
+        const lineEl = document.createElement('div');
+        const cls = classifyResultLine(line);
+        lineEl.className = 'res-line' + (cls ? ' ' + cls : '');
+        if (cls !== 'res-empty') {
+          lineEl.textContent = line;
+        }
+        bodyDiv.appendChild(lineEl);
+      }
+      frag.appendChild(bodyDiv);
+
+      resultContent.replaceChildren(frag);
+    }
+
     async function pollJob(jobId) {
       if (pollTimer) clearTimeout(pollTimer);
       try {
@@ -836,12 +1413,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           headers: { 'X-JRC-Token': JRC_TOKEN }
         });
         const data = await res.json();
+        if (activeJobId && jobId !== activeJobId) return;
         if (!data.ok) {
           outputEl.textContent = 'Hata: ' + (data.error || 'İş okunamadı');
           submitBtn.disabled = false;
           return;
         }
         renderDecision(data.decision, data.dry_run);
+        renderResult(data);
         if (data.status === 'queued') {
           outputEl.textContent = (data.output || '') + `🕒 Sırada bekliyor (#${data.queue_pos || '?'}). Önceki görev bitince otomatik başlayacak.`;
         } else {
@@ -937,14 +1516,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     document.getElementById('runForm').addEventListener('submit', async (e) => {
       e.preventDefault();
       const task = taskEl.value.trim();
-      const cwd = cwdEl.value.trim();
       if (!task) return;
 
-      localStorage.setItem('jrc_web_last_cwd', cwd);
       submitBtn.disabled = true;
       setStatus('running');
       decisionBox.style.display = 'none';
       outputEl.textContent = 'Görev başlatılıyor...';
+      renderResult({
+        status: 'running',
+        task: task,
+        tool: toolEl.value,
+        dry_run: dryRunEl.checked,
+        output: '⏳ Görev başlatılıyor...'
+      });
       startTimeMs = Date.now();
       jobTimer.textContent = '0.0 sn';
 
@@ -957,15 +1541,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           },
           body: JSON.stringify({
             task: task,
-            cwd: cwd,
             tool: toolEl.value,
             dry_run: dryRunEl.checked
           })
         });
         const data = await res.json();
         if (!res.ok || !data.ok) {
-          outputEl.textContent = '✗ Hata: ' + (data.error || res.statusText);
+          const errMsg = '✗ Hata: ' + (data.error || res.statusText);
+          outputEl.textContent = errMsg;
           setStatus('error', 1);
+          renderResult({
+            status: 'error',
+            task: task,
+            tool: toolEl.value,
+            dry_run: dryRunEl.checked,
+            exit_code: 1,
+            result_output: errMsg
+          });
           submitBtn.disabled = false;
           return;
         }
@@ -979,14 +1571,208 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         loadJobs();
         pollJob(data.id);
       } catch (err) {
-        outputEl.textContent = '✗ İstek hatası: ' + err;
+        const errMsg = '✗ İstek hatası: ' + err;
+        outputEl.textContent = errMsg;
         setStatus('error', 1);
+        renderResult({
+          status: 'error',
+          task: task,
+          tool: toolEl.value,
+          dry_run: dryRunEl.checked,
+          exit_code: 1,
+          result_output: errMsg
+        });
         submitBtn.disabled = false;
       }
     });
 
     loadJobs();
     setInterval(loadJobs, 5000);
+
+    // ── Token Harcama Sekmesi ───────────────────────────────────────────────
+    function esc(s) {
+      return String(s ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    let tkVeri = null, tkDonem = 'bugun', tkOlcu = 'toplam';
+    const TK_RENK = ['#3b82f6', '#e07a1f', '#1e9e4a', '#a855f7', '#ef4444', '#06b6d4', '#eab308'];
+    const TK_DIGER = '#8b949e';
+    const TK_MOTOR = { claude: 'Claude Code', agy: 'Antigravity (agy)', api: 'Doğrudan API' };
+    const TK_DONEM = { '5s': 'son 5 saat', bugun: 'bugün', '7g': 'son 7 gün', '30g': 'son 30 gün', tum: 'tüm kayıt' };
+
+    function tkSayi(n) {
+      n = Number(n || 0);
+      for (const [s, e] of [[1e9, ' Mr'], [1e6, ' M'], [1e3, ' B']]) {
+        if (n >= s) {
+          return (n / s).toLocaleString('tr-TR', {
+            maximumFractionDigits: n / s >= 100 ? 0 : n / s >= 10 ? 1 : 2
+          }) + e;
+        }
+      }
+      return String(Math.round(n));
+    }
+    const tkUsd = n => '$' + Number(n || 0).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const tkTam = n => Number(n || 0).toLocaleString('tr-TR');
+
+    function tkRenkler() {
+      const buyuk = l => (l || []).slice().sort((a, b) => b.toplam - a.toplam);
+      const p30 = (tkVeri.pencereler && tkVeri.pencereler['30g'] && tkVeri.pencereler['30g'].model) || [];
+      const ptum = (tkVeri.pencereler && tkVeri.pencereler.tum && tkVeri.pencereler.tum.model) || [];
+      const sira = buyuk(p30).concat(buyuk(ptum)).map(m => m.model);
+      const r = {};
+      let i = 0;
+      for (const m of sira) {
+        if (!(m in r)) r[m] = i < TK_RENK.length ? TK_RENK[i++] : TK_DIGER;
+      }
+      return r;
+    }
+
+    function tokenCiz() {
+      if (!tkVeri || !tkVeri.pencereler) return;
+      const v = tkVeri, w = v.pencereler[tkDonem], t = w.toplam, renk = tkRenkler();
+      const yasEl = document.getElementById('tkYas');
+      yasEl.textContent = (v.yas_dk < 1 ? 'az önce güncellendi' : `${v.yas_dk} dk önce güncellendi`) + (v.ilk_kayit ? ` · ilk kayıt ${v.ilk_kayit}` : '');
+      yasEl.className = 'badge' + (v.yas_dk > 20 ? ' yellow' : ' green');
+
+      const kpi = (ad, deger, alt) => `<div class="kutu"><small>${ad}</small><b>${deger}</b>${alt ? `<small>${alt}</small>` : ''}</div>`;
+      document.getElementById('tkKpi').innerHTML =
+        kpi('Toplam token', tkSayi(t.toplam), tkTam(t.toplam)) +
+        kpi('Çıktı', tkSayi(t.cikti), 'üretilen') +
+        kpi('Girdi', tkSayi(t.girdi), 'önbelleksiz') +
+        kpi('Önbellek okuma', tkSayi(t.onbellek_okuma), 'ucuz tekrar okuma') +
+        kpi('Önbellek yazma', tkSayi(t.onbellek_yazma), '') +
+        kpi('Çağrı', tkTam(t.cagri), 'API cevabı') +
+        kpi('API eşdeğeri', tkUsd(t.usd), 'liste fiyatıyla');
+
+      const pay = (n, c) => `<div class="tk-pay"><i style="width:${t.toplam ? Math.max(1, n / t.toplam * 100).toFixed(1) : 0}%${c ? ';background:' + c : ''}"></i></div>`;
+      document.getElementById('tkMotorlar').innerHTML = ['claude', 'agy', 'api'].map(k => {
+        const m = w.motor[k] || { toplam: 0, cikti: 0, cagri: 0, usd: 0 };
+        return `<div class="tk-motor"><h4><span>${TK_MOTOR[k]}</span><span>%${t.toplam ? (m.toplam / t.toplam * 100).toLocaleString('tr-TR', { maximumFractionDigits: 1 }) : 0}</span></h4>
+          <b>${tkSayi(m.toplam)}</b>${pay(m.toplam)}<small>çıktı ${tkSayi(m.cikti)} · ${tkTam(m.cagri)} çağrı · ${k === 'agy' ? 'abonelik (fiyat yok)' : tkUsd(m.usd)}</small></div>`;
+      }).join('');
+
+      document.getElementById('tkModelRozet').textContent = TK_DONEM[tkDonem];
+      document.getElementById('tkModeller').innerHTML = w.model.length
+        ? `<table class="tk-tablo"><thead><tr><th>Model</th><th>Motor</th><th class="s">Çağrı</th><th class="s">Girdi</th><th class="s">Çıktı</th><th class="s">Önb. okuma</th><th class="s">Önb. yazma</th><th class="s">Toplam</th><th>Pay</th><th class="s">API eşd.</th></tr></thead><tbody>` +
+          w.model.map(m => `<tr><td><i class="tk-nokta" style="background:${renk[m.model] || TK_DIGER}"></i><b>${esc(m.model)}</b></td><td>${esc(m.motor)}</td><td class="s">${tkTam(m.cagri)}</td><td class="s">${tkSayi(m.girdi)}</td><td class="s">${tkSayi(m.cikti)}</td><td class="s">${tkSayi(m.onbellek_okuma)}</td><td class="s">${tkSayi(m.onbellek_yazma)}</td><td class="s"><b>${tkSayi(m.toplam)}</b></td><td class="pay">${pay(m.toplam, renk[m.model])}</td><td class="s">${m.motor === 'agy' ? '–' : tkUsd(m.usd)}</td></tr>`).join('') +
+          '</tbody></table>'
+        : '<div class="sub">Bu dönemde kayıt yok.</div>';
+
+      const gunler = v.gunluk || [], deger = x => Number(x[tkOlcu] || 0), yaz = n => tkOlcu === 'usd' ? tkUsd(n) : tkSayi(n);
+      const gunToplam = g => Object.values(g.modeller).reduce((a, x) => a + deger(x), 0);
+      const tepe = Math.max(...gunler.map(gunToplam), 0);
+      const gorunen = new Set();
+      document.getElementById('tkGrafik').innerHTML = tepe
+        ? `<div class="tk-grafik">` + gunler.map(g => {
+            const top = gunToplam(g), parcalar = Object.entries(g.modeller).filter(([, x]) => deger(x) > 0).sort((a, b) => deger(b[1]) - deger(a[1]));
+            parcalar.forEach(([m]) => gorunen.add(m));
+            const ipucu = `${g.gun.slice(8)}.${g.gun.slice(5, 7)} · ${yaz(top)}\\n` + parcalar.map(([m, x]) => `${m}: ${yaz(deger(x))}`).join('\\n');
+            return `<div class="tk-sutun" title="${esc(ipucu)}">` + parcalar.map(([m, x]) => `<i style="height:${(deger(x) / tepe * 100).toFixed(2)}%;background:${renk[m] || TK_DIGER}"></i>`).join('') + '</div>';
+          }).join('') +
+          `</div><div class="tk-eksen">` + gunler.map((g, i) => `<span>${(gunler.length - 1 - i) % 5 === 0 ? g.gun.slice(8) + '.' + g.gun.slice(5, 7) : ''}</span>`).join('') + `</div>` +
+          `<div class="tk-lejant"><span>En yüksek gün: <b>${yaz(tepe)}</b></span>` + Object.keys(renk).filter(m => gorunen.has(m)).map(m => `<span><i class="tk-nokta" style="background:${renk[m]}"></i>${esc(m)}</span>`).join('') + '</div>'
+        : '<div class="sub">Son 30 günde kayıt yok.</div>';
+
+      document.getElementById('tkKaynaklar').innerHTML = w.kaynak.length
+        ? `<table class="tk-tablo"><thead><tr><th>Kaynak</th><th>Motor</th><th class="s">Toplam</th><th class="s">Çıktı</th><th class="s">API eşd.</th></tr></thead><tbody>` +
+          w.kaynak.slice(0, 15).map(k => `<tr><td><b>${esc(k.kaynak)}</b></td><td>${esc(k.motor)}</td><td class="s">${tkSayi(k.toplam)}</td><td class="s">${tkSayi(k.cikti)}</td><td class="s">${k.motor === 'agy' ? '–' : tkUsd(k.usd)}</td></tr>`).join('') + '</tbody></table>'
+        : '<div class="sub">Kayıt yok.</div>';
+
+      const o = v.oturumlar || [];
+      document.getElementById('tkOturumRozet').textContent = `son ${o.length}`;
+      document.getElementById('tkOturumlar').innerHTML = o.length
+        ? `<table class="tk-tablo"><thead><tr><th>Zaman</th><th>Emir / oturum</th><th>Proje</th><th>Model</th><th class="s">Çağrı</th><th class="s">Toplam</th><th class="s">Çıktı</th><th class="s">API eşd.</th></tr></thead><tbody>` +
+          o.map(x => `<tr><td style="white-space:nowrap">${esc(x.basla)}${x.sure_dk ? ` <small>· ${x.sure_dk} dk</small>` : ''}</td><td class="baslik" title="${esc(x.baslik || '')}">${esc(x.baslik || '(' + x.oturum + ')')}</td><td>${esc(x.proje)}</td><td>${x.modeller.map(m => `<i class="tk-nokta" style="background:${renk[m] || TK_DIGER}" title="${esc(m)}"></i>`).join('')}${esc(x.modeller.map(m => m.replace(/^claude-/, '')).join(', '))}</td><td class="s">${tkTam(x.cagri)}</td><td class="s"><b>${tkSayi(x.toplam)}</b></td><td class="s">${tkSayi(x.cikti)}</td><td class="s">${tkUsd(x.usd)}</td></tr>`).join('') +
+          '</tbody></table>'
+        : '<div class="sub">Oturum yok.</div>';
+
+      const q = v.agy_kota;
+      document.getElementById('tkKota').innerHTML = q && (q.gruplar || []).length
+        ? q.gruplar.map(g => `<div style="font-weight:700;font-size:13px;margin:4px 0">${esc(g.ad || '')}</div>` + g.kovalar.map(b => {
+            const kalan = Math.round((b.kalan || 0) * 100);
+            return `<div class="hm-satir"><span>${esc((b.ad || '').replace(' Remaining', '').replace('Weekly Limit', 'Haftalık').replace('Five Hour Limit', '5 saatlik'))}</span><b>%${kalan} kaldı</b></div><div class="tk-pay"><i style="width:${kalan}%;background:${kalan < 20 ? 'var(--red)' : 'var(--green)'}"></i></div>`;
+          }).join('')).join('') + `<small class="sub">ölçüm: ${new Date(q.zaman * 1000).toLocaleString('tr-TR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })} (jrc usage)</small>`
+        : '<div class="sub">Kota ölçümü yok (jrc usage).</div>';
+
+      document.getElementById('tkNot').innerHTML =
+        'Kayıt: Claude Code oturumlarının gerçek <code>usage</code> sayaçları (jrc, botlar, elle açılan tüm oturumlar) + maliyet defterindeki agy ve doğrudan API çağrıları. ' +
+        'Kalıcı defter bu bilgisayarda <code>~/.cache/jroute/tokens.db</code>; 5 dakikada bir ve her jrc görevinden sonra güncellenir. ' +
+        '<b>API eşdeğeri</b> liste fiyatıyla hesaptır, Claude aboneliğinde ayrıca ödenmez; agy için liste fiyatı yoktur. ' +
+        "agy'de yalnız token sayacı dönen çağrılar (Telegram ajanı, proxy) görünür; terminalde etkileşimli agy oturumları sayaç vermez.";
+    }
+
+    async function tokenGetir(refresh = false) {
+      try {
+        const res = await fetch(refresh ? '/api/tokens?refresh=1' : '/api/tokens', {
+          headers: { 'X-JRC-Token': JRC_TOKEN }
+        });
+        const v = await res.json();
+        if (!res.ok || !v.zaman) {
+          document.getElementById('tkKpi').innerHTML = '<div class="sub">Token defteri henüz yazılmadı (jrc tokens).</div>';
+          return;
+        }
+        tkVeri = v;
+        tokenCiz();
+        const bTop = v.pencereler && v.pencereler.bugun && v.pencereler.bugun.toplam;
+        const badgeEl = document.getElementById('tabTokenBadge');
+        if (bTop && badgeEl) {
+          badgeEl.style.display = 'inline-flex';
+          badgeEl.textContent = `${tkSayi(bTop.toplam)} · ${tkUsd(bTop.usd)}`;
+        }
+      } catch (e) {
+        document.getElementById('tkKpi').innerHTML = '<div class="sub">Token verisi okunamadı.</div>';
+      }
+    }
+
+    document.querySelectorAll('#tkDonem button').forEach(b => b.addEventListener('click', () => {
+      tkDonem = b.dataset.d;
+      document.querySelectorAll('#tkDonem button').forEach(x => x.classList.toggle('aktif', x === b));
+      if (tkVeri) tokenCiz();
+    }));
+
+    document.querySelectorAll('#tkOlcu button').forEach(b => b.addEventListener('click', () => {
+      tkOlcu = b.dataset.o;
+      document.querySelectorAll('#tkOlcu button').forEach(x => x.classList.toggle('aktif', x === b));
+      if (tkVeri) tokenCiz();
+    }));
+
+    document.getElementById('tkYenile').addEventListener('click', () => tokenGetir(true));
+
+    function switchTab(tab, updateHash = true) {
+      const isTokens = tab === 'tokens';
+      document.querySelectorAll('#mainTabs .nav-tab').forEach(b => {
+        b.classList.toggle('active', b.dataset.tab === (isTokens ? 'tokens' : 'console'));
+      });
+      document.getElementById('consolePanel').style.display = isTokens ? 'none' : '';
+      document.getElementById('tokenPanel').style.display = isTokens ? 'block' : 'none';
+      if (updateHash) {
+        const h = isTokens ? '#tokens' : '';
+        if (location.hash !== h) {
+          history.replaceState(null, '', location.pathname + h);
+        }
+      }
+      if (isTokens) tokenGetir(false);
+    }
+
+    document.querySelectorAll('#mainTabs .nav-tab').forEach(b => {
+      b.addEventListener('click', () => switchTab(b.dataset.tab, true));
+    });
+
+    function syncHashTab() {
+      const h = decodeURIComponent(location.hash.replace(/^#\\/?/, '')).toLowerCase();
+      if (h === 'tokens' || h === 'token' || h === 'hermes-token') {
+        switchTab('tokens', false);
+      } else if (h === 'console' || h === '') {
+        switchTab('console', false);
+      }
+    }
+    window.addEventListener('hashchange', syncHashTab);
+    tokenGetir(false);
+    syncHashTab();
   </script>
 </body>
 </html>
@@ -1050,13 +1836,7 @@ class JRCWebHandler(BaseHTTPRequestHandler):
 
         if path == "/" or path == "/index.html":
             tok = ensure_token()
-            last_cwd = get_last_cwd()
-            html = (
-                HTML_TEMPLATE
-                .replace("__DEFAULT_CWD__", last_cwd.replace('"', "&quot;"))
-                .replace("__JRC_TOKEN_JSON__", json.dumps(tok))
-                .replace("__LAST_CWD_JSON__", json.dumps(last_cwd))
-            )
+            html = HTML_TEMPLATE.replace("__JRC_TOKEN_JSON__", json.dumps(tok))
             raw = html.encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1080,6 +1860,33 @@ class JRCWebHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"ok": True, "jobs": jobs, "queue_len": len(pos)})
             return
 
+        if path == "/api/tokens":
+            qs = urllib.parse.parse_qs(parsed.query)
+            force_refresh = qs.get("refresh", ["0"])[0] in ("1", "true", "yes")
+            veri: dict[str, Any] | None = None
+            if force_refresh:
+                try:
+                    jrc_usage.collect_agy_usage()
+                except Exception:
+                    pass
+                try:
+                    veri = jrc_tokens.refresh()
+                except Exception:
+                    veri = None
+            if veri is None:
+                summary_path = jrc_tokens._summary_file()
+                try:
+                    veri = json.loads(summary_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    try:
+                        veri = jrc_tokens.refresh()
+                    except Exception:
+                        veri = {"zaman": None}
+            veri["yas_dk"] = int((time.time() - veri["zaman"]) // 60) if veri.get("zaman") else None
+            veri["ok"] = True
+            self._send_json(HTTPStatus.OK, veri)
+            return
+
         if path.startswith("/api/job/"):
             job_id = path.split("/api/job/", 1)[1].strip("/")
             meta = _load_job_meta(job_id)
@@ -1095,12 +1902,15 @@ class JRCWebHandler(BaseHTTPRequestHandler):
 
             log_file = _job_log_path(job_id)
             full_output = ""
+            result_output = ""
             chunk = ""
             next_offset = offset
             if log_file.exists():
                 try:
                     raw_bytes = log_file.read_bytes()
-                    full_output = strip_ansi(raw_bytes.decode("utf-8", errors="replace"))
+                    raw_str = raw_bytes.decode("utf-8", errors="replace")
+                    full_output = strip_ansi(raw_str)
+                    result_output = extract_result_section(raw_str, bool(meta.get("dry_run")))
                     chunk_bytes = raw_bytes[offset:]
                     chunk = strip_ansi(chunk_bytes.decode("utf-8", errors="replace"))
                     next_offset = len(raw_bytes)
@@ -1114,6 +1924,7 @@ class JRCWebHandler(BaseHTTPRequestHandler):
                     **meta,
                     "queue_pos": _queue_positions().get(job_id),
                     "output": full_output,
+                    "result_output": result_output,
                     "chunk": chunk,
                     "next_offset": next_offset,
                 },
@@ -1154,8 +1965,7 @@ class JRCWebHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Görev metni (task) boş olamaz."})
             return
 
-        raw_cwd = str(data.get("cwd") or "").strip() or get_last_cwd()
-        cwd_path = Path(os.path.expanduser(raw_cwd)).resolve()
+        cwd_path = Path(os.path.expanduser(DEFAULT_CWD)).resolve()
         if not cwd_path.exists() or not cwd_path.is_dir():
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
@@ -1166,8 +1976,6 @@ class JRCWebHandler(BaseHTTPRequestHandler):
         raw_tool = str(data.get("tool") or "").strip().lower()
         tool = raw_tool if raw_tool in ("claude", "agy") else "auto"
         dry_run = bool(data.get("dry_run", False))
-
-        set_last_cwd(raw_cwd)
 
         job_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
         WEB_JOBS_DIR.mkdir(parents=True, exist_ok=True)

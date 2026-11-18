@@ -7,7 +7,7 @@ Kaynaklar:
   • Maliyet defteri (odoo/claude_maliyet_defteri.csv): agy (Antigravity) ve doğrudan API (OpenRouter/Google)
     çağrıları; ayrıca transcript'i silinmiş eski Claude çağrıları (tek seferlik geri doldurma).
 
-Çıktı: yönetim panelinin okuduğu özet JSON (odoo/addons/.jrc_tokens.json → /yonetim#hermes · Token sekmesi).
+Çıktı: jrc web konsolunun okuduğu özet JSON (odoo/addons/.jrc_tokens.json → jrc web konsolu 127.0.0.1:8787/#tokens · Token Harcama sekmesi).
 
 Kullanım:
   jrc tokens            topla + özet yaz + terminalde göster
