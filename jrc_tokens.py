@@ -32,7 +32,7 @@ HOME = Path.home()
 CACHE_DIR = HOME / ".cache" / "jroute"
 DB_FILE = Path(os.environ.get("JRC_TOKENS_DB") or CACHE_DIR / "tokens.db")
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
-PROJELER = HOME / "Desktop" / "projeler"
+PROJELER = HOME / "Desktop" / "jev" / "projeler"
 CSV_DEFTER = Path(os.environ.get("JRC_MALIYET_CSV") or PROJELER / "odoo" / "claude_maliyet_defteri.csv")
 AGY_QUOTA_CACHE = CACHE_DIR / "agy_quota_cache.json"
 

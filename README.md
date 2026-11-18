@@ -131,18 +131,23 @@ Karar tek yerde verilir: `jrc_gate.decide(kaynak, görev)`.
 - Bağlı noktalar (odoo): `maliyet_defteri.claude_calistir`, `argon_gemini_proxy.py` (Hermes+Peri), `hizli_yol.py`.
 - Kota fallback'ini de servis değil jrc yapar (`jrc_gate.fallback`); motor kilitliyse sessiz geçiş yapılmaz.
 
-## Yönetici Katmanı (Fable işi yönetir)
+## Yönetici Katmanı (Opus işi yönetir)
 
-jrc motoru, modeli ve eforu seçtikten sonra işin **nasıl** yapılacağını Fable belirler (`jrc_director.py`):
+jrc motoru, modeli ve eforu seçtikten sonra işin **nasıl** yapılacağını Opus belirler (`jrc_director.py`):
 
-1. Fable salt-okunur araçlarla (`Read,Grep,Glob`) projeye ve `.jrc_context.md`'ye bakıp yürütücü için bir iş emri yazar.
+1. Opus salt-okunur araçlarla (`Read,Grep,Glob`) projeye ve `.jrc_context.md`'ye bakıp yürütücü için bir iş emri yazar.
 2. Seçilen yürütücü (claude/agy) iş emriyle çalışır; `.jrc_context.md`'ye yazmaz, raporunu `~/.cache/jroute/reports/` altına bırakır.
-3. Fable raporu ve değişen dosyaları denetler, `.jrc_context.md` → "Ortak Notlar" satırını yazar.
+3. Opus raporu ve değişen dosyaları denetler, `.jrc_context.md` → "Ortak Notlar" satırını yazar.
 
-- Yürütücü zaten Fable ise ek çağrı yapılmaz; Fable hem yönetir hem notu kendi yazar.
-- Fable'a ulaşılamazsa görev eski (yönetimsiz) akışla çalışır. `-d` / `--json` Fable'ı çağırmaz.
+Token tasarrufu:
+- **Oturum yönetimi (`reuse_session`)**: iş emri ve not aynı Opus oturumunda yürür. Not adımı `--resume` ile devam eder; görev, iş emri ve Opus'un okuduğu dosyalar yeniden gönderilmez (önbellekten gelir). Oturum görev başına açılır, görev bitince bırakılır; geçmiş görevden göreve büyümez. Devam edilemezse tam istemle tekrar dener.
+- **Basit görevleri atla (`skip_trivial`)**: efor `low` ya da rota `claude_haiku`/`agy_flash` ise Opus hiç çağrılmaz; yürütücü notu kendi yazar.
+- İş emri en fazla 30 satır; Opus'a yalnızca gereken dosyaları açması söylenir.
+
+- Yürütücü zaten Opus ise ek çağrı yapılmaz; Opus hem yönetir hem notu kendi yazar.
+- Opus'a ulaşılamazsa görev eski (yönetimsiz) akışla çalışır. `-d` / `--json` Opus'u çağırmaz.
 - Yalnızca `jrc` / `jroute` görevlerinde geçerlidir; `jrc_gate.decide()` kullanan botlar/servisler kapsam dışıdır.
-- Aç/kapat: `jrc director on|off`. Ayar: `jrc_policy.json` → `"director": {"enabled", "model", "effort", "timeout_s"}`. Çağrılar geçit defterine `director` kaynağıyla yazılır.
+- Aç/kapat: `jrc director on|off`. Ayar: `jrc_policy.json` → `"director": {"enabled", "model", "effort", "timeout_s", "skip_trivial", "reuse_session"}`. Çağrılar geçit defterine `director` kaynağıyla yazılır.
 
 ## Token defteri (`jrc tokens`)
 
@@ -154,3 +159,21 @@ jrc motoru, modeli ve eforu seçtikten sonra işin **nasıl** yapılacağını F
 - **Pano:** özet `odoo/addons/.jrc_tokens.json` dosyasına yazılır; `eretnastore.com/yonetim#hermes-token` (Hermes → 🔥 Token) okur.
 - **Komut:** `jrc tokens` (terminal raporu), `jrc tokens --json`.
 - "API eşdeğeri $" liste fiyatıyla hesaptır (`PRICES` tablosu); abonelikte ödenmez.
+
+## Yerel Web Konsolu (`jrc web` / `jrc-web.service`)
+
+`jrc_web.py` yalnızca yerel `127.0.0.1:8787` adresinde çalışan, sıfır harici bağımlılıklı (`stdlib http.server`) web arayüzüdür. Görevleri konsoldaki `jrc` ile birebir aynı akıştan geçirerek arka planda çalıştırır ve çıktıyı canlı aktarır. API uç noktaları (`/api/jobs`, `/api/job/<id>`, `/api/run`) `~/.cache/jroute/web_token` (0600) doğrulaması gerektirir.
+
+Servis olarak yönetim (`~/.config/systemd/user/jrc-web.service`):
+
+```bash
+# Servisi etkinleştir ve başlat
+systemctl --user daemon-reload && systemctl --user enable --now jrc-web.service
+
+# Durum kontrolü ve yeniden başlatma
+systemctl --user status jrc-web.service
+systemctl --user restart jrc-web.service
+
+# Logları izleme
+journalctl --user -u jrc-web -n 50 -f
+```

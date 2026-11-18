@@ -1,4 +1,4 @@
-#!/home/efe/Desktop/projeler/jev/.venv/bin/python3
+#!/home/efe/Desktop/jev/.venv/bin/python3
 """
 Jev Router Etkileşimli Terminal Konsolu (jrc)
 
@@ -583,7 +583,7 @@ def run_interactive_console(args: argparse.Namespace, extra_args: list[str]) -> 
 
         os.chdir(target_cwd)
 
-        # jrc motoru/modeli seçti; işin nasıl yapılacağını ve hafıza notunu Fable yönetir.
+        # jrc motoru/modeli seçti; işin nasıl yapılacağını ve hafıza notunu yönetici (Opus) yönetir.
         def run_agent(_text: str = text, _decision: dict[str, Any] = decision,
                       _print: bool = one_shot_print, _cmd: list[str] = cmd) -> None:
             if not jrc_director.active_for(_decision):
@@ -664,13 +664,22 @@ def run_gate_command(name: str, rest: list[str]) -> int:
         else:
             print(f"Motor kilidi: {jrc_gate.load_policy().get('engine', 'auto')}  (kullanım: jrc engine auto|claude|agy)")
         return 0
+    if name == "fable":
+        if rest and rest[0].lower() in ("on", "off", "aç", "ac", "kapat"):
+            on = rest[0].lower() in ("on", "aç", "ac")
+            jrc_gate.set_route_substitute({} if on else {"claude_fable": "claude_opus"})
+        sub = jrc_gate.load_policy().get("route_substitute") or {}
+        durum = f"{red}kapalı → {sub['claude_fable']}{reset}" if sub.get("claude_fable") else f"{green}açık{reset}"
+        print(f"Fable: {durum}  {dim}(kullanım: jrc fable on|off · off = kota ikamesi fable→opus){reset}")
+        return 0
     if name == "director":
         if rest and rest[0].lower() in ("on", "off", "aç", "ac", "kapat"):
             jrc_director.set_enabled(rest[0].lower() in ("on", "aç", "ac"))
         cfg = jrc_director.config()
         durum = f"{green}açık{reset}" if cfg.get("enabled") else f"{red}kapalı{reset}"
         print(f"Yönetici: {durum} · model {cfg['model']} · efor {cfg['effort']} · zaman aşımı {cfg['timeout_s']} sn"
-              f"  {dim}(kullanım: jrc director on|off){reset}")
+              f"  {dim}(kullanım: jrc director on|off){reset}\n"
+              f"  {dim}basit görevi atla: {cfg.get('skip_trivial')} · oturum devamı: {cfg.get('reuse_session')}{reset}")
         return 0
     if name == "policy":
         print(json.dumps(jrc_gate.load_policy(), ensure_ascii=False, indent=2))
@@ -695,7 +704,7 @@ def run_gate_command(name: str, rest: list[str]) -> int:
         print(f"  ├─ {bold}{src:<14}{reset} {dim}{'pin:' + pin if pin else 'analiz'}{reset}  {dist}")
     if not sm["by_source"]:
         print(f"  └─ {dim}henüz kayıt yok ({jrc_gate.LEDGER_FILE}){reset}")
-    print(f"{dim}Komutlar: jrc gate [saat] · jrc audit · jrc engine auto|claude|agy · jrc director on|off · jrc policy{reset}\n")
+    print(f"{dim}Komutlar: jrc gate [saat] · jrc audit · jrc engine auto|claude|agy · jrc fable on|off · jrc director on|off · jrc policy{reset}\n")
     return 0
 
 
@@ -756,7 +765,10 @@ def main() -> int:
     )
 
     args, unknown = parser.parse_known_args()
-    if unknown and unknown[0].lower() in ("gate", "audit", "engine", "director", "policy"):
+    if unknown and unknown[0].lower() == "web":
+        import jrc_web
+        return jrc_web.main(unknown[1:])
+    if unknown and unknown[0].lower() in ("gate", "audit", "engine", "fable", "director", "policy"):
         return run_gate_command(unknown[0].lower(), unknown[1:])
     if unknown and unknown[0].lower() in ("tokens", "token"):
         import jrc_tokens

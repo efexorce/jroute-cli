@@ -7,3 +7,7 @@ node_modules/
 .env
 .jrc_state.json
 .jrc_context.md
+projeler/
+*.bak-*
+.venv.py312.bak/
+jroute-cli-agensi.zip

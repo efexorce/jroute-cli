@@ -55,7 +55,20 @@
       "pin": "claude_fable",
       "effort": "high",
       "max_effort": "high",
-      "allow_tools": ["claude"]
+      "allow_tools": [
+        "claude"
+      ]
     }
+  },
+  "director": {
+    "enabled": true,
+    "model": "opus",
+    "effort": "medium",
+    "timeout_s": 300,
+    "skip_trivial": true,
+    "reuse_session": true
+  },
+  "route_substitute": {
+    "claude_fable": "claude_opus"
   }
 }

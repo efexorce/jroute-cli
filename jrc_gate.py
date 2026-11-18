@@ -128,6 +128,42 @@ def set_engine(engine: str) -> str:
     return engine
 
 
+def substitute_route(route_key: str, pol: dict[str, Any] | None = None) -> tuple[str, str | None]:
+    """Kota ikamesi: jrc_policy.json → "route_substitute" (ör. {"claude_fable": "claude_opus"}).
+
+    Döner: (kullanılacak rota, ikame olduysa asıl rota yoksa None). Boş {} → ikame kapalı.
+    """
+    pol = pol if pol is not None else load_policy()
+    sub = pol.get("route_substitute") or {}
+    new = sub.get(route_key) if isinstance(sub, dict) else None
+    if new and new in ROUTE_PROFILES and new != route_key:
+        return new, route_key
+    return route_key, None
+
+
+def set_route_substitute(mapping: dict[str, str]) -> dict[str, str]:
+    """route_substitute alanını politika dosyasına yerinde yazar (hardlink korunur)."""
+    pf = _policy_file()
+    try:
+        user = json.loads(pf.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        user = {}
+    user["route_substitute"] = dict(mapping)
+    save_policy(user)
+    return user["route_substitute"]
+
+
+def _apply_substitute(decision: dict[str, Any], pol: dict[str, Any]) -> dict[str, Any]:
+    new, orig = substitute_route(decision.get("route_key", ""), pol)
+    if not orig:
+        return decision
+    out = _from_profile(new, decision.get("effort"))
+    out.update({k: v for k, v in decision.items() if k not in out})
+    out["substituted_from"] = orig
+    out["label"] += f" · {orig.split('_', 1)[-1]}→{new.split('_', 1)[-1]} (kota ikamesi)"
+    return out
+
+
 def _source_policy(pol: dict[str, Any], source: str) -> dict[str, Any]:
     merged = dict(pol.get("default", {}))
     merged.update(pol.get("sources", {}).get(source, {}))
@@ -253,6 +289,9 @@ def decide(
             decision["analysis_error"] = str(exc)[:200]
             mode = "varsayilan"
 
+    # Kota ikamesi (pin/etiket/analiz sonrası): ör. keabilgisayar_yazar pin claude_fable → claude_opus
+    decision = _apply_substitute(decision, pol)
+
     if tool_lock:
         decision = _remap_tool(decision, tool_lock)
     elif allow and decision["tool"] not in allow:
@@ -273,6 +312,7 @@ def decide(
     _log({"type": "decision", "ts": decision["ts"], "source": source, "tool": decision["tool"],
           "model": decision["model"], "effort": decision["effort"], "mode": mode,
           "lock": decision["engine_lock"], "ms": decision["latency_ms"],
+          **({"sub": decision["substituted_from"]} if decision.get("substituted_from") else {}),
           "task": " ".join((task or "").split())[:120]})
     return decision
 
@@ -282,6 +322,7 @@ def record(source: str, decision: dict[str, Any], task: str = "") -> None:
     _log({"type": "decision", "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "source": source,
           "tool": decision["tool"], "model": decision["model"], "effort": decision["effort"],
           "mode": "analiz", "lock": decision.get("tool"), "ms": decision.get("latency_ms", 0),
+          **({"sub": decision["substituted_from"]} if decision.get("substituted_from") else {}),
           "task": " ".join((task or "").split())[:120]})
 
 
@@ -347,7 +388,7 @@ _GATED = re.compile(r"(jrc_gate|claude_calistir|argon_calistir|jrc_koprusu)")
 
 def audit(roots: list[str | Path] | None = None) -> list[dict[str, Any]]:
     """claude/agy'yi doğrudan çağıran ve geçide bağlı OLMAYAN dosyaları listeler."""
-    roots = roots or [Path.home() / "Desktop/projeler/odoo", Path.home() / ".hermes/plugins"]
+    roots = roots or [Path.home() / "Desktop/jev/projeler/odoo", Path.home() / ".hermes/plugins"]
     found: list[dict[str, Any]] = []
     for root in roots:
         for path in Path(root).rglob("*.py"):

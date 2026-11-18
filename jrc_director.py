@@ -1,17 +1,25 @@
-"""JRC Yönetici Katmanı (jrc_director) — işin NASIL yapılacağını Fable yönetir.
+"""JRC Yönetici Katmanı (jrc_director) — işin NASIL yapılacağını Opus yönetir.
 
 Akış (jrc / jroute insan görevleri):
     1. jrc motoru + modeli + eforu seçer (router.analyze_task_with_jev) — değişmedi.
-    2. Fable salt-okunur araçlarla projeye bakıp yürütücü için bir "iş emri" yazar.
+    2. Opus salt-okunur araçlarla projeye bakıp yürütücü için bir "iş emri" yazar.
     3. Seçilen yürütücü (claude/agy) iş emriyle çalışır; `.jrc_context.md`'ye YAZMAZ,
        bitince kısa raporunu ~/.cache/jroute/reports/ altına bırakır.
-    4. Fable raporu + değişen dosyaları denetler ve `.jrc_context.md` içindeki
+    4. Opus raporu + değişen dosyaları denetler ve `.jrc_context.md` içindeki
        'Ortak Notlar' satırını yazar.
 
-Yürütücü zaten Fable ise ek çağrı yapılmaz: Fable hem yönetir hem notu kendi yazar.
-Fable'a ulaşılamazsa (kota, zaman aşımı) görev eski yönetimsiz akışla çalışır.
+Yürütücü zaten yönetici modelse (Opus) ek çağrı yapılmaz: hem yönetir hem notu kendi yazar.
+Yöneticiye ulaşılamazsa (kota, zaman aşımı) görev eski yönetimsiz akışla çalışır.
 
-Ayar: jrc_policy.json → "director": {"enabled", "model", "effort", "timeout_s"}
+Token tasarrufu (oturum yönetimi):
+  - İş emri ve not aynı yönetici oturumunda yürür: not adımı `--resume` ile iş emri
+    oturumuna devam eder; görev/iş emri/proje okuması yeniden gönderilmez, önbellekten gelir.
+    Oturum görev başına açılır ve görev bitince bırakılır (sınırsız büyüyen geçmiş yok).
+  - Basit görevlerde (efor low veya haiku/flash rotası) yönetici hiç çağrılmaz;
+    yürütücü notu kendi yazar (skip_trivial).
+
+Ayar: jrc_policy.json → "director": {"enabled", "model", "effort", "timeout_s",
+      "skip_trivial", "reuse_session"}
       (`jrc director on|off`). Yalnızca standart kütüphane kullanır.
 """
 
@@ -22,6 +30,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -32,7 +41,11 @@ if str(HERE) not in sys.path:
 import jrc_context  # noqa: E402
 import jrc_gate  # noqa: E402
 
-DEFAULTS: dict[str, Any] = {"enabled": True, "model": "fable", "effort": "medium", "timeout_s": 300}
+DEFAULTS: dict[str, Any] = {
+    "enabled": True, "model": "opus", "effort": "medium", "timeout_s": 300,
+    "skip_trivial": True, "reuse_session": True,
+}
+TRIVIAL_ROUTES = {"claude_haiku", "agy_flash"}
 REPORT_DIR = Path.home() / ".cache" / "jroute" / "reports"
 PLAN_LIMIT = 6000  # agy -p argüman sınırı (131KB) ve yürütücü bağlamı için
 NO_NOTE = "YOK"
@@ -57,27 +70,46 @@ def set_enabled(enabled: bool) -> None:
     pf.write_text(json.dumps(user, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def director_name() -> str:
+    """'opus' / 'claude-opus-5-5' → 'Opus' (ekran ve istem metinleri için)."""
+    m = str(config()["model"]).lower().replace("claude-", "")
+    return m.split("-")[0].capitalize()
+
+
+def _is_trivial(decision: dict[str, Any]) -> bool:
+    return decision.get("effort") == "low" or decision.get("route_key") in TRIVIAL_ROUTES
+
+
 def _is_director_model(model: str, cfg: dict[str, Any]) -> bool:
     return str(cfg["model"]).lower() in str(model).lower()
 
 
 def active_for(decision: dict[str, Any]) -> bool:
-    """Bu karar için ayrı bir Fable yönetim adımı gerekli mi?"""
+    """Bu karar için ayrı bir yönetici (Opus) adımı gerekli mi?"""
     cfg = config()
     if not cfg.get("enabled"):
         return False
-    # Yürütücü Fable'ın kendisiyse zaten o yönetir ve notu o yazar.
+    # Basit görevde yönetici çağrısı (2 Opus isteği) işin kendisinden pahalı olur.
+    if cfg.get("skip_trivial", True) and _is_trivial(decision):
+        return False
+    # Yürütücü yönetici modelin kendisiyse zaten o yönetir ve notu o yazar.
     return not (decision.get("tool") == "claude" and _is_director_model(decision.get("model", ""), cfg))
 
 
-def _ask_fable(prompt: str, cwd: Path, task: str) -> str:
-    """Fable'ı salt-okunur araçlarla tek seferlik çalıştırır; yanıt metnini döndürür."""
+def _ask_director(prompt: str, cwd: Path, task: str, session: str | None = None, resume: bool = False) -> str:
+    """Yönetici modeli salt-okunur araçlarla tek seferlik çalıştırır; yanıt metnini döndürür.
+
+    session verilirse: resume=False → o kimlikle yeni oturum açar; resume=True → o oturuma devam eder.
+    """
     cfg = config()
     cmd = [
         "claude", "--model", str(cfg["model"]), "--effort", str(cfg["effort"]),
-        "-p", "--tools", "Read,Grep,Glob",
-        "--strict-mcp-config", "--no-session-persistence",
+        "-p", "--tools", "Read,Grep,Glob", "--strict-mcp-config",
     ]
+    if session:
+        cmd += ["--resume", session] if resume else ["--session-id", session]
+    else:
+        cmd.append("--no-session-persistence")
     t0 = time.perf_counter()
     proc = subprocess.run(
         cmd, input=prompt, capture_output=True, text=True, cwd=str(cwd),
@@ -102,8 +134,8 @@ def _executor_line(decision: dict[str, Any]) -> str:
     return f"{decision.get('tool')} · {decision.get('model')} · efor {decision.get('effort')}"
 
 
-def plan(task: str, decision: dict[str, Any], cwd: Path) -> str:
-    """Yürütücü için iş emrini Fable'a yazdırır."""
+def plan(task: str, decision: dict[str, Any], cwd: Path, session: str | None = None) -> str:
+    """Yürütücü için iş emrini yöneticiye yazdırır (session verilirse oturum açılır)."""
     prompt = f"""Sen JEV iş akışının yöneticisisin. Görevi sen YAPMIYORSUN; jrc'nin seçtiği başka bir ajan yapacak.
 Senin işin o ajan için bir iş emri yazmak: işin nasıl yapılacağını sen belirliyorsun.
 
@@ -125,9 +157,10 @@ Yürütücü senin gördüklerini görmeyecek, yalnızca yazdığın metni ve g�
 - Dikkat: dokunulmaması gerekenler, geri alınamaz adımlar, bu projede geçerli kurallar.
 - Bitti ölçütü: işin gerçekten çalıştığının nasıl doğrulanacağı.
 
-Görev basitse iş emri de birkaç satır olsun; adım uydurma. En fazla 40 satır.
+Token bütçesi sınırlı: yalnızca gerçekten gereken dosyaları aç, büyük dosyalarda Grep ile hedefe git.
+Görev basitse iş emri de birkaç satır olsun; adım uydurma. En fazla 30 satır.
 Yalnızca iş emrini yaz: giriş cümlesi, açıklama ya da soru ekleme."""
-    return _ask_fable(prompt, cwd, task)[:PLAN_LIMIT]
+    return _ask_director(prompt, cwd, task, session=session)[:PLAN_LIMIT]
 
 
 def new_report_path() -> Path:
@@ -138,11 +171,11 @@ def new_report_path() -> Path:
 def executor_brief(work_order: str, report_path: Path) -> str:
     """Yürütücünün sistem istemine / görev metnine eklenecek yönetici talimatı."""
     return (
-        "\n\n[JEV yönetici (Fable) iş emri — bu görevi aşağıdaki plana göre yap. "
+        f"\n\n[JEV yönetici ({director_name()}) iş emri — bu görevi aşağıdaki plana göre yap. "
         "Plan gerçek durumla çelişirse gerçeğe uy ve farkı raporuna yaz.]\n"
         f"{work_order}\n\n"
         "[Hafıza kuralı] '.jrc_context.md' dosyasını oku ama ona YAZMA; 'Ortak Notlar' satırını iş bitince "
-        "yönetici (Fable) yazacak. İşin sonunda şu dosyaya kısa bir rapor yaz (düz metin): "
+        f"yönetici ({director_name()}) yazacak. İşin sonunda şu dosyaya kısa bir rapor yaz (düz metin): "
         f"{report_path}\n"
         "Raporda: ne yaptın, hangi dosya/kayıt/adres değişti, neyi doğruladın, ne eksik ya da başarısız kaldı."
     )
@@ -184,9 +217,23 @@ def write_note(
     report: str,
     output_tail: str,
     exit_code: int,
+    session: str | None = None,
 ) -> str | None:
-    """Fable'a 'Ortak Notlar' satırını yazdırır ve .jrc_context.md'ye ekler. Not yoksa None."""
+    """Yöneticiye 'Ortak Notlar' satırını yazdırır ve .jrc_context.md'ye ekler. Not yoksa None.
+
+    session verilirse iş emri oturumuna devam edilir: görev ve iş emri yeniden gönderilmez.
+    """
     changes = _file_changes(cwd)
+    changes_txt = json.dumps(changes, ensure_ascii=False) if changes else "yok / tespit edilmedi"
+    if session:
+        try:
+            note = _clean_note(_ask_director(_note_prompt_resumed(decision, report, output_tail, exit_code, changes_txt),
+                                             cwd, task, session=session, resume=True))
+            if note:
+                jrc_context.append_user_note(cwd, note)
+            return note
+        except Exception:
+            pass  # oturum bulunamadı vb. → tam istemle tekrar dene
     prompt = f"""Sen JEV iş akışının yöneticisisin. Verdiğin iş emrini başka bir ajan uyguladı; şimdi sonucu denetleyip
 projenin ortak hafızasına (`.jrc_context.md` → 'Ortak Notlar') girecek notu yazacaksın. Bu notu ileride aynı
 projede çalışacak ajanlar okuyacak; onlara neyin değiştiğini ve neye dikkat etmeleri gerektiğini söylemeli.
@@ -214,9 +261,16 @@ Yürütücü çıktısının sonu (yalnızca tek seferlik modda dolu):
 {output_tail[-3000:]}
 </cikti>
 
-Çalışma dizininde değişen dosyalar: {json.dumps(changes, ensure_ascii=False) if changes else "yok / tespit edilmedi"}
+Çalışma dizininde değişen dosyalar: {changes_txt}
 
-Raporu olduğu gibi kabul etme: değişen dosyalara okuma araçlarınla bakıp iddiaları doğrulayabildiğin kadar doğrula.
+{NOTE_RULES}"""
+    note = _clean_note(_ask_director(prompt, cwd, task))
+    if note:
+        jrc_context.append_user_note(cwd, note)
+    return note
+
+
+NOTE_RULES = f"""Raporu olduğu gibi kabul etme: değişen dosyalara okuma araçlarınla bakıp iddiaları doğrulayabildiğin kadar doğrula.
 Doğrulayamadığın şeyi "rapora göre" diye belirt. İş yarım kaldıysa ya da başarısızsa bunu ve kalan işi açıkça yaz.
 
 Notu şu biçimde ver:
@@ -227,17 +281,40 @@ Notu şu biçimde ver:
   ve iş emrinde zaten yazan kuralları tekrarlama.
 - Görev yalnızca bir sorgu/kontrol idiyse ve kalıcı hiçbir şey değişmediyse sadece {NO_NOTE} yaz.
 Yalnızca not satırını (ya da {NO_NOTE}) yaz; başka hiçbir şey ekleme."""
-    note = " ".join(_ask_fable(prompt, cwd, task).split())
+
+
+def _note_prompt_resumed(decision: dict[str, Any], report: str, output_tail: str, exit_code: int,
+                         changes_txt: str) -> str:
+    """Aynı oturumda devam ederken kısa not istemi: görev ve iş emri zaten bağlamda."""
+    return f"""Yürütücü ({_executor_line(decision)}) verdiğin iş emrini uyguladı (çıkış kodu: {exit_code}).
+Şimdi sonucu denetleyip `.jrc_context.md` → 'Ortak Notlar' için notu yaz.
+
+Yürütücünün raporu (boşsa rapor bırakmadı):
+<rapor>
+{report[:6000]}
+</rapor>
+
+Yürütücü çıktısının sonu (yalnızca tek seferlik modda dolu):
+<cikti>
+{output_tail[-3000:]}
+</cikti>
+
+Değişen dosyalar: {changes_txt}
+
+{NOTE_RULES}"""
+
+
+def _clean_note(raw: str) -> str | None:
+    note = " ".join(raw.split())
     if note.startswith("- "):
         note = note[2:]
     if not note or note.strip(" .`*").upper() == NO_NOTE:
         return None
-    jrc_context.append_user_note(cwd, note)
     return note
 
 
 def _say(msg: str) -> None:
-    print(f"\033[35m🎬 Yönetici (Fable):\033[0m {msg}", file=sys.stderr)
+    print(f"\033[35m🎬 Yönetici ({director_name()}):\033[0m {msg}", file=sys.stderr)
 
 
 def run(
@@ -247,14 +324,15 @@ def run(
     print_mode: bool,
     build_cmd: Callable[[str | None], list[str]],
 ) -> int:
-    """Yönetimli çalıştırma: Fable iş emri → yürütücü → Fable notu. Yürütücünün çıkış kodunu döndürür.
+    """Yönetimli çalıştırma: yönetici iş emri → yürütücü → yönetici notu (aynı oturum). Yürütücünün çıkış kodunu döndürür.
 
     build_cmd(brief) seçilen yürütücünün komutunu üretir; brief=None yönetimsiz (eski) komuttur.
     """
     work_order = ""
+    session = str(uuid.uuid4()) if config().get("reuse_session", True) else None
     try:
         _say("iş emri hazırlanıyor…")
-        work_order = plan(task, decision, cwd)
+        work_order = plan(task, decision, cwd, session=session)
     except KeyboardInterrupt:
         raise
     except Exception as exc:
@@ -278,7 +356,7 @@ def run(
         report = ""
     try:
         _say("sonuç denetleniyor, ortak hafıza notu yazılıyor…")
-        note = write_note(task, decision, cwd, work_order, report, tail, exit_code)
+        note = write_note(task, decision, cwd, work_order, report, tail, exit_code, session=session)
         _say(f"\033[32m✓ .jrc_context.md notu:\033[0m {note}" if note else "kalıcı değişiklik yok, not eklenmedi.")
     except KeyboardInterrupt:
         _say("not yazımı iptal edildi.")
@@ -286,6 +364,6 @@ def run(
         _say(f"\033[33mnot yazılamadı ({str(exc)[:160]}).\033[0m")
         if report:  # not kaybolmasın: yürütücü raporunu kaynağı belli olacak şekilde ekle
             jrc_context.append_user_note(
-                cwd, f"(Fable yazamadı; {decision.get('model')} raporundan) " + " ".join(report.split())[:500]
+                cwd, f"({director_name()} yazamadı; {decision.get('model')} raporundan) " + " ".join(report.split())[:500]
             )
     return exit_code

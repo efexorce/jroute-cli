@@ -1,4 +1,4 @@
-#!/home/efe/Desktop/projeler/jev/.venv/bin/python3
+#!/home/efe/Desktop/jev/.venv/bin/python3
 """
 Jev / Ollaya Üst Router Betiği (Claude Code & Antigravity CLI)
 
@@ -34,7 +34,7 @@ JEV_SYSTEM_PROMPT = (
     "ve mimari kararlar proje kökündeki '.jrc_context.md' dosyasında tutulur. Göreve başlamadan önce .jrc_context.md "
     "içeriğini oku, bağlamı koru"
 )
-# Yönetimsiz akışta (ya da yürütücü Fable'ın kendisiyken) notu yürütücü yazar;
+# Yönetimsiz akışta (ya da yürütücü yönetici modelin (Opus) kendisiyken) notu yürütücü yazar;
 # yönetimli akışta bu cümle yerine jrc_director.executor_brief() eklenir.
 JEV_SELF_NOTE_PROMPT = " ve aldığın kritik mimari kararları bu dosyadaki 'Ortak Notlar' bölümüne ekle."
 os.environ["JEV_ORIGIN"] = "1"  # exec/subprocess ile çocuk sürece geçer
@@ -114,9 +114,11 @@ def collect_workspace_context(cwd: Path) -> dict[str, Any]:
 def detect_explicit_route_override(task: str) -> str | None:
     """Kullanıcı görev içinde açıkça belirli bir alt model istediyse (örn. 'işi fable yapsın', 'opus ile') algılar."""
     lower = task.lower()
+    # Açık istek kalıpları (işi X / X ile / X yapsın). Birden çok model geçiyorsa metinde
+    # en önce geçen açık kalıp kazanır; çıplak "fable" sözcüğü yalnızca en son denenir
+    # (ör. "işi opus yapsın, fable kotası…" → opus).
     patterns: list[tuple[str, str]] = [
         (r"\b(fable\s+(ile|yapsın|yap|kullan|çalıştır)|işi\s+fable|use\s+fable|model\s+fable)\b", "claude_fable"),
-        (r"\bfable\b", "claude_fable"),
         (r"\b(opus\s+(ile|yapsın)|işi\s+opus|use\s+opus)\b", "claude_opus"),
         (r"\b(sonnet\s+(ile|yapsın)|işi\s+sonnet|use\s+sonnet)\b", "claude_sonnet"),
         (r"\b(haiku\s+(ile|yapsın)|işi\s+haiku|use\s+haiku)\b", "claude_haiku"),
@@ -124,9 +126,15 @@ def detect_explicit_route_override(task: str) -> str | None:
         (r"\b(carbon\s+(ile|yapsın)|işi\s+carbon|use\s+carbon)\b", "agy_carbon"),
         (r"\b(hydrogen\s+(ile|yapsın)|işi\s+hydrogen|use\s+hydrogen)\b", "agy_hydrogen"),
     ]
+    best: tuple[int, str] | None = None
     for pat, route_key in patterns:
-        if re.search(pat, lower):
-            return route_key
+        m = re.search(pat, lower)
+        if m and (best is None or m.start() < best[0]):
+            best = (m.start(), route_key)
+    if best:
+        return best[1]
+    if re.search(r"\bfable\b", lower):
+        return "claude_fable"
     return None
 
 
@@ -160,7 +168,8 @@ def analyze_task_with_jev(
     route_criteria = {k: v["criteria"] for k, v in ROUTE_PROFILES.items()}
 
     t0 = time.perf_counter()
-    with TypeSafeClient(base_url=base_url, api_key=api_key) as client:
+    # Python 3.14+ stdlib zstd içerdiğinden SDK gövdeyi varsayılan olarak sıkıştırıyor; yerel Ollaya zstd açmıyor → 400 invalid JSON.
+    with TypeSafeClient(base_url=base_url, api_key=api_key, compression=False) as client:
         # largha'nın bağlamı çok dar: sorular + kriterler bütçenin çoğunu kullanıyor.
         # Önce kompakt state ile dene; 422 "dropped to fit the context" gelirse daha da kısalt.
         last_exc: Exception | None = None
@@ -305,9 +314,20 @@ def _build_decision(task: str, forced_tool: str | None, response: Any, elapsed_m
         elif target_tool == "agy" and chosen_route_key == "agy_flash":
             chosen_route_key = "agy_argon"
 
+    # Kota ikamesi (jrc_policy.json → route_substitute, ör. fable→opus): son rota belirlendikten sonra
+    substituted_from: str | None = None
+    try:
+        import jrc_gate
+        chosen_route_key, substituted_from = jrc_gate.substitute_route(chosen_route_key)
+    except Exception:
+        pass
+
     profile = ROUTE_PROFILES[chosen_route_key]
     final_tool = profile["tool"]
     final_model = profile["model"]
+    label = profile["label"]
+    if substituted_from:
+        label += f" · {substituted_from.split('_', 1)[-1]}→{chosen_route_key.split('_', 1)[-1]} (kota ikamesi)"
 
     # agy model isimlerinde efor soneki uyumu
     if final_tool == "agy":
@@ -318,7 +338,8 @@ def _build_decision(task: str, forced_tool: str | None, response: Any, elapsed_m
         "model": final_model,
         "effort": effort,
         "route_key": chosen_route_key,
-        "label": profile["label"],
+        "label": label,
+        "substituted_from": substituted_from,
         "latency_ms": elapsed_ms,
         "decision_model": response.model,
         "metrics": {
@@ -342,7 +363,7 @@ def build_cli_command(
 ) -> list[str]:
     """Seçilen araç ve alt modele göre çalıştırılacak CLI komut dizisini üretir.
 
-    brief: yönetici (Fable) iş emri + hafıza kuralı; verilirse yürütücü notu kendisi yazmaz.
+    brief: yönetici (Opus) iş emri + hafıza kuralı; verilirse yürütücü notu kendisi yazmaz.
     """
     tool = decision["tool"]
     model = decision["model"]
@@ -505,7 +526,7 @@ def main() -> int:
 
     import jrc_director
     if jrc_director.active_for(decision):
-        # jrc motoru/modeli seçti; işin nasıl yapılacağını ve hafıza notunu Fable yönetir.
+        # jrc motoru/modeli seçti; işin nasıl yapılacağını ve hafıza notunu yönetici (Opus) yönetir.
         rc = jrc_director.run(
             task_text, decision, target_cwd, args.print_mode,
             lambda brief: build_cli_command(
