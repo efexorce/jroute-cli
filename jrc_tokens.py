@@ -36,6 +36,14 @@ CLAUDE_PROJECTS = HOME / ".claude" / "projects"
 PROJELER = HOME / "Desktop" / "jev" / "projeler"
 CSV_DEFTER = Path(os.environ.get("JRC_MALIYET_CSV") or PROJELER / "odoo" / "claude_maliyet_defteri.csv")
 AGY_QUOTA_CACHE = CACHE_DIR / "agy_quota_cache.json"
+CLAUDE_QUOTA_CACHE = CACHE_DIR / "claude_quota_cache.json"
+# Claude /usage alanları → panel etiketi (null gelenler atlanır)
+CLAUDE_QUOTA_KEYS = [
+    ("five_hour", "5 saatlik"),
+    ("seven_day", "Haftalık"),
+    ("seven_day_opus", "Haftalık · Opus"),
+    ("seven_day_sonnet", "Haftalık · Sonnet"),
+]
 
 
 def _summary_file() -> Path:
@@ -407,6 +415,21 @@ def summarize() -> dict[str, Any]:
                 for g in (q.get("response") or {}).get("groups", [])]}
         except Exception:
             pass
+        claude_quota = None
+        try:
+            cq = json.loads(CLAUDE_QUOTA_CACHE.read_text(encoding="utf-8"))
+            resp = cq.get("response") or {}
+            kovalar = []
+            for key, label in CLAUDE_QUOTA_KEYS:
+                b = resp.get(key)
+                if isinstance(b, dict) and b.get("utilization") is not None:
+                    used = float(b["utilization"])
+                    kovalar.append({"ad": label, "kalan": max(0.0, 100.0 - used) / 100.0,
+                                    "kullanilan": used, "sifirlanma": b.get("resets_at")})
+            if kovalar:
+                claude_quota = {"zaman": cq.get("fetched_at"), "plan": cq.get("plan"), "kovalar": kovalar}
+        except Exception:
+            pass
         return {
             "zaman": now,
             "ilk_kayit": datetime.fromtimestamp(first).strftime("%d.%m.%Y") if first else None,
@@ -414,6 +437,7 @@ def summarize() -> dict[str, Any]:
             "gunluk": [{"gun": d, "modeller": m} for d, m in daily.items()],
             "oturumlar": sessions,
             "agy_kota": quota,
+            "claude_kota": claude_quota,
             "fiyatlar": {p: list(v) for p, v in PRICES},
         }
     finally:
@@ -430,6 +454,11 @@ def write_summary(data: dict[str, Any]) -> Path:
 
 
 def refresh() -> dict[str, Any]:
+    try:  # Claude /usage kotası (5 sa + haftalık); 2 dk'dan tazeyse ağa çıkılmaz
+        from jrc_usage import collect_claude_quota
+        collect_claude_quota(max_age=120)
+    except Exception:
+        pass
     collect()
     data = summarize()
     write_summary(data)

@@ -20,6 +20,9 @@ AGY_AUTH_FILE = AGY_STATE_DIR / "quota_auth.json"
 CLAUDE_DIR = Path.home() / ".claude"
 CACHE_DIR = Path.home() / ".cache" / "jroute"
 AGY_QUOTA_CACHE_FILE = CACHE_DIR / "agy_quota_cache.json"
+CLAUDE_CREDENTIALS_FILE = CLAUDE_DIR / ".credentials.json"
+CLAUDE_QUOTA_CACHE_FILE = CACHE_DIR / "claude_quota_cache.json"
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
 
 def format_tokens(count: int) -> str:
@@ -169,6 +172,51 @@ def collect_agy_usage() -> dict[str, Any]:
         "fetched_at": None,
         "groups": [],
     }
+
+
+def collect_claude_quota(max_age: float = 0.0) -> dict[str, Any] | None:
+    """Claude Code `/usage` ile aynı kaynaktan (OAuth usage uç noktası) 5 saatlik ve haftalık kotayı çeker.
+
+    Kimlik ~/.claude/.credentials.json içinden yalnızca OKUNUR (dosyaya yazılmaz). Sonuç
+    ~/.cache/jroute/claude_quota_cache.json önbelleğine yazılır; canlı sorgu başarısızsa önbellek döner.
+    `max_age` > 0 ise önbellek o kadar saniyeden tazeyse ağa çıkılmaz.
+    """
+    cached: dict[str, Any] | None = None
+    if CLAUDE_QUOTA_CACHE_FILE.is_file():
+        try:
+            cached = json.loads(CLAUDE_QUOTA_CACHE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            cached = None
+    if cached and max_age > 0 and time.time() - float(cached.get("fetched_at") or 0) < max_age:
+        return cached
+    try:
+        creds = json.loads(CLAUDE_CREDENTIALS_FILE.read_text(encoding="utf-8")).get("claudeAiOauth") or {}
+        token = str(creds.get("accessToken") or "")
+        if not token:
+            return cached
+        req = urllib.request.Request(
+            CLAUDE_USAGE_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "anthropic-beta": "oauth-2025-04-20",
+                "Content-Type": "application/json",
+                "User-Agent": "jrc-usage",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        snapshot = {
+            "fetched_at": time.time(),
+            "plan": creds.get("subscriptionType"),
+            "response": payload,
+        }
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = CLAUDE_QUOTA_CACHE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+        tmp.replace(CLAUDE_QUOTA_CACHE_FILE)
+        return snapshot
+    except Exception:
+        return cached
 
 
 def _parse_iso_ts(ts_str: str) -> float | None:

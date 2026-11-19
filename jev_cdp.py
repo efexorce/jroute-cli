@@ -22,23 +22,54 @@ Kullanım:
 """
 import asyncio, base64, json, os, socket, subprocess, sys, time
 from pathlib import Path
+from urllib.parse import urlparse
 
-SOCK = Path.home() / ".cache" / "jev_cdp" / "cdp.sock"
+SOCK = Path(os.environ.get("JEV_CDP_SOCK") or (Path.home() / ".cache" / "jev_cdp" / "cdp.sock"))
 LOG = SOCK.with_name("daemon.log")
 PORT_FILES = [Path.home() / ".config/google-chrome/DevToolsActivePort",
               Path.home() / "snap/chromium/common/chromium/DevToolsActivePort"]
 APPROVE_WAIT = 300  # kullanıcının "İzin ver"e basması için süre (sn)
 
 
+def _tcp_open(host, port, timeout=2.0):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def ws_url():
     env = os.environ.get("JEV_CDP_WS")
     if env:
+        u = urlparse(env)
+        port = u.port or (443 if u.scheme == "wss" else 80)
+        if u.scheme not in ("ws", "wss") or not u.hostname:
+            raise SystemExit(f"Geçersiz JEV_CDP_WS adresi: {env}")
+        if not _tcp_open(u.hostname, port):
+            raise SystemExit(
+                f"Chrome kapalı veya Chrome'da uzaktan hata ayıklama kapalı "
+                f"({u.hostname}:{port} portuna bağlanılamadı)"
+            )
         return env
+    stale = []
     for p in PORT_FILES:
         if p.exists():
-            port, path = p.read_text().split()[:2]
-            return f"ws://127.0.0.1:{port}{path}"
-    raise SystemExit("Chrome DevToolsActivePort yok: chrome://inspect/#remote-debugging açık mı?")
+            parts = p.read_text().split()
+            if len(parts) >= 2:
+                port, path = parts[:2]
+                if port.isdigit() and _tcp_open("127.0.0.1", int(port)):
+                    return f"ws://127.0.0.1:{port}{path}"
+                stale.append(f"{p} (port {port} dinlemiyor)")
+    if stale:
+        raise SystemExit(
+            "Chrome kapalı veya Chrome'da uzaktan hata ayıklama kapalı "
+            f"(bayat DevToolsActivePort: {', '.join(stale)}; chrome://inspect/#remote-debugging açık mı?)"
+        )
+    raise SystemExit(
+        "Chrome kapalı veya Chrome'da uzaktan hata ayıklama kapalı "
+        "(DevToolsActivePort bulunamadı; chrome://inspect/#remote-debugging açık mı?)"
+    )
 
 
 # ---------------------------------------------------------------- daemon
@@ -189,27 +220,87 @@ def send(args, timeout=700):
 def alive():
     try:
         return send(["ping"], timeout=5)["ok"]
-    except OSError:
+    except (OSError, ValueError, KeyError):
         return False
+
+
+def _last_log_line(since=0):
+    try:
+        with open(LOG, "rb") as f:
+            f.seek(since)
+            text = f.read().decode("utf-8", errors="replace").strip()
+        if not text:
+            text = LOG.read_text(errors="replace").strip()
+        return text.splitlines()[-1] if text else "(log boş)"
+    except OSError:
+        return "(log okunamadı)"
+
+
+def _notify(msg, urgent=False, replace_id=None, expire_ms=None):
+    cmd = ["notify-send", "-p"]
+    if urgent:
+        cmd += ["-u", "critical"]
+    else:
+        cmd += ["-u", "normal"]
+    if replace_id and str(replace_id).isdigit():
+        cmd += ["-r", str(replace_id)]
+    if expire_ms is not None:
+        cmd += ["-t", str(expire_ms)]
+    cmd += ["JEV", msg]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        nid = (r.stdout or "").strip()
+        return nid if nid.isdigit() else None
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def start():
     if alive():
         return True
+    url = ws_url()  # çözülemezse veya TCP port kapalıysa bildirim göndermeden çıkar
     SOCK.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.Popen([sys.executable, os.path.abspath(__file__), "_daemon"],
-                     stdout=open(LOG, "a"), stderr=subprocess.STDOUT,
-                     stdin=subprocess.DEVNULL, start_new_session=True)
-    subprocess.run(["notify-send", "-u", "critical", "JEV",
-                    "Chrome'da uzaktan hata ayıklama için BİR KEZ 'İzin ver'e tıklayın"],
-                   stderr=subprocess.DEVNULL)
-    print("Chrome'da tek seferlik 'İzin ver' bekleniyor...", file=sys.stderr, flush=True)
+    log_pos = LOG.stat().st_size if LOG.exists() else 0
+    env = os.environ.copy()
+    env["JEV_CDP_WS"] = url
+    with open(LOG, "a") as lf:
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "_daemon"],
+            stdout=lf, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, start_new_session=True, env=env,
+        )
+    # Onay penceresi gerektirmeyen bağlantılar (--remote-debugging-port) veya
+    # anında düşen hatalar için kısa ön bekleme: gereksiz bildirim gönderme.
+    pre_end = time.time() + 1.0
+    while time.time() < pre_end:
+        if alive():
+            return True
+        if proc.poll() is not None:
+            raise SystemExit(f"Chrome bağlantısı kurulamadı: {_last_log_line(log_pos)}")
+        time.sleep(0.1)
+
+    nid = _notify(
+        "Chrome penceresinde üstte çıkan (adres çubuğu altında / chrome://inspect) "
+        "'İzin ver' düğmesine BİR KEZ tıklayın",
+        urgent=True,
+    )
+    print(
+        "Chrome penceresinde üstte çıkan tek seferlik 'İzin ver' onayı bekleniyor...",
+        file=sys.stderr, flush=True,
+    )
     end = time.time() + APPROVE_WAIT + 10
     while time.time() < end:
         if alive():
+            if nid:
+                _notify("Chrome bağlantısı onaylandı.", replace_id=nid, expire_ms=2500)
             return True
-        time.sleep(1)
-    raise SystemExit("Bağlantı kurulamadı; log: " + str(LOG))
+        if proc.poll() is not None:
+            _notify("Onay alınamadı, işlem iptal", replace_id=nid, expire_ms=8000)
+            raise SystemExit(f"Bağlantı kurulamadı (daemon kapandı): {_last_log_line(log_pos)}")
+        time.sleep(0.5)
+    proc.terminate()
+    _notify("Onay alınamadı, işlem iptal", replace_id=nid, expire_ms=8000)
+    raise SystemExit("Onay alınamadı, işlem iptal; log: " + str(LOG))
 
 
 def main():

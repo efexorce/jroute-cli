@@ -393,6 +393,8 @@ def build_cli_command(
     skip_permissions: bool = False,
     extra_args: list[str] | None = None,
     brief: str | None = None,
+    allowed_user_id: int | None = None,
+    system_prompt: str | None = None,
 ) -> list[str]:
     """Seçilen araç ve alt modele göre çalıştırılacak CLI komut dizisini üretir.
 
@@ -402,16 +404,17 @@ def build_cli_command(
     model = decision["model"]
     effort = decision["effort"]
     extra = extra_args or []
+    base_sys_prompt = system_prompt if system_prompt is not None else JEV_SYSTEM_PROMPT
 
     if tool == "claude":
         cmd = ["claude", "--model", model, "--effort", effort,
-               "--append-system-prompt", JEV_SYSTEM_PROMPT + (f".{brief}" if brief else JEV_SELF_NOTE_PROMPT)]
+               "--append-system-prompt", base_sys_prompt + (f".{brief}" if brief else JEV_SELF_NOTE_PROMPT)]
         if skip_permissions:
             cmd.append("--dangerously-skip-permissions")
         if print_mode:
             cmd.append("-p")
         cmd.extend(extra)
-        cmd.append(jrc_context.resolve_emir_refs(task))
+        cmd.append(jrc_context.resolve_emir_refs(task, allowed_user_id=allowed_user_id))
         return cmd
 
     # tool == "agy"
@@ -419,7 +422,7 @@ def build_cli_command(
     if skip_permissions:
         cmd.append("--dangerously-skip-permissions")
     base_task = task if ".jrc_context.md" in task else f"[Hafıza: .jrc_context.md] {task}"
-    task_payload = jrc_context.resolve_emir_refs(base_task)
+    task_payload = jrc_context.resolve_emir_refs(base_task, allowed_user_id=allowed_user_id)
     if brief:
         task_payload += brief
     if print_mode:

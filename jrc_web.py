@@ -12,15 +12,21 @@ from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
 import json
+import mimetypes
 import os
 import re
 import secrets
+import shutil
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
+from datetime import datetime
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -86,6 +92,13 @@ jrc_context.scan_project_files = _safe_scan_project_files
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
 DEFAULT_CWD = os.environ.get("JRC_WEB_CWD") or str(Path(__file__).resolve().parent)
+ODOO_AI_CWD = os.environ.get("ODOO_AI_CWD") or "/home/efe/Desktop/jev/projeler/odoo/addons/eretna_bizimhesap"
+ERETNA_SYSTEM_PROMPT = (
+    "Bu görev Eretna Store Odoo yönetim/satış panelinden (#yapayzeka) geldi. "
+    "Yalnızca çalışma dizinindeki (eretna_bizimhesap addon kökü) dosyalarla çalışabilirsin. "
+    "Bu dizin dışındaki sunucu dosyalarına veya klasörlere erişme, okuma veya yazma. "
+    "Projede Git kullanılmamaktadır. Ortak hafıza çalışma dizinindeki '.jrc_context.md' dosyasında tutulur."
+)
 
 CACHE_DIR = Path.home() / ".cache" / "jroute"
 TOKEN_FILE = CACHE_DIR / "web_token"
@@ -110,11 +123,87 @@ IMAGE_MIME_TYPES: dict[str, str] = {
     ".gif": "image/gif",
 }
 
+NOTIF_TARGET_CHAT_ID = 900224672
+AJANCEVAPLARI_FILE = Path("/home/efe/Desktop/jev/projeler/odoo/ajancevaplari.txt")
+TELEGRAM_USERS_FILE = Path("/home/efe/Desktop/jev/projeler/odoo/telegram_kullanicilar.json")
+HERMES_STATE_DB = Path.home() / ".hermes" / "state.db"
+OPENCLAW_DEV_DB = Path.home() / ".openclaw" / "agents" / "dev" / "agent" / "openclaw-agent.sqlite"
+NOTIF_MIME_TYPES: dict[str, str] = {
+    **IMAGE_MIME_TYPES,
+    ".pdf": "application/pdf",
+    ".txt": "text/plain; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
+    ".csv": "text/csv; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".html": "text/html; charset=utf-8",
+    ".htm": "text/html; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".mp4": "video/mp4",
+    ".zip": "application/zip",
+}
+
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\r")
 DIRECTOR_ORDER_RE = re.compile(
-    r"🎬 Yönetici \([^)]+\):[^\n]*iş emri hazırlanıyor[^\n]*\n\x1b\[2m[\s\S]*?\x1b\[0m\r?\n+"
+    r"🎬 Yönetici \([^)]+\):[^\n]*iş emri[^\n]*\n\x1b\[2m[\s\S]*?\x1b\[0m\r?\n*"
 )
-ROUTER_CMD_RE = re.compile(r"^\s*└─ Komut\s*:[^\n]*\n+", flags=re.MULTILINE)
+DIRECTOR_WAIT_RE = re.compile(
+    r"🎬 Yönetici \([^)]+\):[^\n]*iş emri[^\n]*\s*$"
+)
+DIRECTOR_FALLBACK_RE = re.compile(
+    r"🎬 Yönetici \([^)]+\):[^\n]*iş emri alınamadı[^\n]*\n*"
+)
+ROUTER_CMD_RE = re.compile(r"^\s*└─ Komut\s*:[^\n]*\n*", flags=re.MULTILINE)
+POST_DIRECTOR_LINE_RE = re.compile(
+    r"^\s*🎬 Yönetici \([^)]+\):\s*(?:sonuç denetleniyor|✓ \.jrc_context\.md|kalıcı değişiklik yok|not yazımı|not yazılamadı)"
+)
+POST_WORKER_LINE_RE = re.compile(r"^\s*✓ Ajan oturumu tamamlandı\.")
+RUNTIME_NOISE_RE = re.compile(
+    r"^\s*(?:root agent idle;\s*waiting for \d+ background task|[⏺●▶]\s+\w+\()"
+)
+INTERMEDIATE_STATUS_RE = re.compile(
+    r"(?:tamamlanması\s+bekleniyor|açılması\s+bekleniyor|tamamlanınca\s+.*doğrulayacağım)[.…]*\s*$",
+    re.IGNORECASE,
+)
+MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((?:file://|https?://|/)[^)]+\)")
+SUMMARY_BULLET_RE = re.compile(r"^(\s*)(?:[-*•]|\d+[.)])\s+(.*)$")
+SUMMARY_HEADING_RE = re.compile(r"^\s*#{1,6}\s+(.*)$")
+SUMMARY_BOLD_HEADING_RE = re.compile(r"^\s*\*\*([^*]{2,60}?)\*\*\s*:?\s*$")
+SUMMARY_INLINE_LABEL_RE = re.compile(r"^\s*\*\*([^*]{2,50}?):\*\*\s+(.+)$")
+SUMMARY_ACTION_VERB_RE = re.compile(
+    r"\b("
+    r"eklendi|ekledim|değiştirildi|değiştirdim|değişti|değişmedi|"
+    r"silindi|sildim|kaldırıldı|kaldırdım|güncellendi|güncelledim|"
+    r"oluşturuldu|oluşturdum|üretildi|ürettim|hazırlandı|kuruldu|"
+    r"yazıldı|yazdım|taşındı|aktarıldı|düzeltildi|düzelttim|"
+    r"onarıldı|giderildi|yenilendi|başlatıldı|durduruldu|"
+    r"alındı|kaydedildi|yedeklendi|yedekledim|bağlandı|"
+    r"kapatıldı|açıldı|çıkarıldı|indirildi|yükseltildi|"
+    r"gönderildi|iletildi|paylaşıldı|uygulandı|tanımlandı|"
+    r"yapıldı|yaptım|yapılmadı|tamamlandı|korundu|susturuldu|"
+    r"bulamadım|yapamadım|erişemedim|gerekiyor|engellendi|başarısız"
+    r")\b",
+    re.IGNORECASE,
+)
+SUMMARY_HOUSEKEEPING_RE = re.compile(
+    r"^(?:[-*•\s]*(?:yönetici raporu|jev görev raporu|işlem raporu|detaylı rapor|kısa rapor|rapor|not|proje ortak hafızası)\s*:?\s*(?:\d{8}-\d{6}-\d+\.md|\.jrc_context\.md|/home/efe/\.(?:cache/jroute/reports|sandbox_home))|"
+    r"\(?.*(?:\.cache/jroute/reports/|\b\d{8}-\d{6}-\d+\.md\b).*dosyasına yazıldı|"
+    r".*\.jrc_context\.md[^\n]*Ortak Notlar)",
+    re.IGNORECASE,
+)
+SUMMARY_SKIP_SECTION_RE = re.compile(
+    r"(?:nasıl çalışıyor|neden yetmedi|teşhis|kök neden|komut çıktıları|beklenen karar)",
+    re.IGNORECASE,
+)
+SUMMARY_VERIFY_SECTION_RE = re.compile(
+    r"^(?:doğrulama|doğrulamalar|test\b)",
+    re.IGNORECASE,
+)
+SUMMARY_FILE_EXT_RE = re.compile(
+    r"\b[\w.-]+\.(?:py|js|ts|html|css|json|md|pdf|png|jpe?g|webp|gif|mp4|conf|service|sh|ico|svg|xml|sql|db)\b",
+    re.IGNORECASE,
+)
 
 
 def strip_ansi(text: str) -> str:
@@ -122,22 +211,183 @@ def strip_ansi(text: str) -> str:
 
 
 def extract_result_section(raw_text: str, dry_run: bool = False) -> str:
-    """Çıktının son anlamlı bölümünü (ajanın nihai yanıtını) ayıklar."""
+    """Çıktıdan yalnızca ajanın nihai yanıt bloğunu (ham iş emri ve alt bilgi hariç) ayıklar."""
     if not raw_text or not raw_text.strip():
         return ""
     if dry_run:
         return strip_ansi(raw_text).strip()
+
     m_dir = DIRECTOR_ORDER_RE.search(raw_text)
     if m_dir:
-        return strip_ansi(raw_text[m_dir.end():]).strip()
-    clean = strip_ansi(raw_text)
-    m_cmd = ROUTER_CMD_RE.search(clean)
-    if m_cmd:
-        tail = clean[m_cmd.end():].strip()
-        if tail:
-            return tail
-    lines = clean.strip().splitlines()
-    return "\n".join(lines[-40:])
+        body = strip_ansi(raw_text[m_dir.end():])
+    else:
+        clean = strip_ansi(raw_text)
+        if DIRECTOR_WAIT_RE.search(clean):
+            return ""
+        m_fb = DIRECTOR_FALLBACK_RE.search(clean)
+        if m_fb:
+            body = clean[m_fb.end():]
+        else:
+            m_cmd = ROUTER_CMD_RE.search(clean)
+            if m_cmd:
+                body = clean[m_cmd.end():]
+            elif clean.lstrip().startswith("⚡ Jev") and "✗" not in clean and "Traceback" not in clean:
+                return ""
+            else:
+                body = clean
+
+    kept: list[str] = []
+    for ln in body.splitlines():
+        if POST_DIRECTOR_LINE_RE.match(ln) or POST_WORKER_LINE_RE.match(ln):
+            continue
+        if RUNTIME_NOISE_RE.match(ln):
+            continue
+        kept.append(ln)
+
+    # Akış sırasında yarım kalıp bir sonraki satırda tam basılan önek satırlarını ayıkla
+    deduped: list[str] = []
+    for i, ln in enumerate(kept):
+        s = ln.strip()
+        if len(s) >= 12 and s[-1] not in ".!?:)" and i + 1 < len(kept):
+            nxt = kept[i + 1].strip()
+            if nxt.startswith(s[:16]) and len(nxt) > len(s):
+                continue
+        deduped.append(ln)
+
+    # Ara "bekleniyor..." bildirim satırlarını, arkada nihai yanıt varsa düşür
+    idx = 0
+    while idx < len(deduped):
+        s = deduped[idx].strip()
+        if not s:
+            idx += 1
+            continue
+        if INTERMEDIATE_STATUS_RE.search(s) and any(x.strip() for x in deduped[idx + 1:]):
+            idx += 1
+            continue
+        break
+
+    return "\n".join(deduped[idx:]).strip()
+
+
+def _clean_summary_md(line: str) -> str:
+    s = MD_LINK_RE.sub(r"\1", line)
+    s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
+    s = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"\1", s)
+    s = re.sub(r"`([^`]+)`", r"\1", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _trim_summary_line(text: str, limit: int = 210) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def summarize_result(
+    raw_text: str,
+    dry_run: bool = False,
+    status: str | None = None,
+    max_lines: int = 10,
+) -> str:
+    """Ajanın nihai yanıtından yalnızca yapılan işlemleri özetleyen kısa listeyi döndürür."""
+    if not raw_text or not raw_text.strip():
+        return ""
+    if dry_run:
+        return strip_ansi(raw_text).strip()
+
+    section = extract_result_section(raw_text, dry_run=False)
+    if status in ("error", "cancelled"):
+        return section if section else strip_ansi(raw_text).strip()
+    if not section:
+        return ""
+
+    in_fence = False
+    content_lines: list[str] = []
+    for ln in section.splitlines():
+        stripped = ln.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if stripped in ("---", "***", "___"):
+            continue
+        if stripped.startswith(("diff --git ", "--- a/", "+++ b/", "@@ ")):
+            continue
+        if stripped.startswith("|") and stripped.endswith("|"):
+            continue
+        content_lines.append(ln)
+
+    selected: list[str] = []
+    fallback_plain: list[str] = []
+    current_sec = ""
+    lead_taken = False
+
+    for ln in content_lines:
+        stripped = ln.strip()
+        if not stripped:
+            continue
+
+        m_head = SUMMARY_HEADING_RE.match(stripped) or SUMMARY_BOLD_HEADING_RE.match(stripped)
+        if m_head:
+            current_sec = _clean_summary_md(m_head.group(1)).rstrip(":")
+            continue
+
+        m_inline_lbl = SUMMARY_INLINE_LABEL_RE.match(stripped)
+        if m_inline_lbl:
+            lbl = _clean_summary_md(m_inline_lbl.group(1)).rstrip(":")
+            current_sec = lbl if (SUMMARY_SKIP_SECTION_RE.search(lbl) or SUMMARY_VERIFY_SECTION_RE.search(lbl)) else ""
+
+        cleaned = _clean_summary_md(stripped)
+        if not cleaned:
+            continue
+        if SUMMARY_HOUSEKEEPING_RE.search(cleaned) and len(cleaned) < 260:
+            continue
+
+        if len(fallback_plain) < 5:
+            fallback_plain.append(_trim_summary_line(cleaned, 220))
+
+        m_bul = SUMMARY_BULLET_RE.match(ln)
+        if not lead_taken and not m_bul and not current_sec and not m_inline_lbl:
+            lead_taken = True
+            selected.append(_trim_summary_line(cleaned, 220))
+            continue
+
+        if SUMMARY_SKIP_SECTION_RE.search(current_sec):
+            continue
+        if SUMMARY_VERIFY_SECTION_RE.search(current_sec) and len(selected) >= 3:
+            continue
+
+        if m_bul:
+            indent_len = len(m_bul.group(1))
+            body_txt = _clean_summary_md(m_bul.group(2))
+            if not body_txt or SUMMARY_HOUSEKEEPING_RE.search(body_txt):
+                continue
+            if body_txt.endswith(":") and len(body_txt) < 65 and not SUMMARY_ACTION_VERB_RE.search(body_txt):
+                continue
+            prefix = "  • " if indent_len >= 2 else "• "
+            has_verb = bool(SUMMARY_ACTION_VERB_RE.search(body_txt))
+            has_concrete = (
+                ("→" in body_txt)
+                or bool(SUMMARY_FILE_EXT_RE.search(body_txt))
+                or (":" in body_txt[:45])
+            )
+            if has_verb or has_concrete:
+                selected.append(prefix + _trim_summary_line(body_txt, 200))
+        elif m_inline_lbl:
+            selected.append("• " + _trim_summary_line(cleaned, 200))
+        else:
+            if SUMMARY_ACTION_VERB_RE.search(cleaned):
+                selected.append(_trim_summary_line(cleaned, 200))
+
+        if len(selected) >= max_lines:
+            break
+
+    if not selected:
+        selected = fallback_plain[:4]
+
+    return "\n".join(selected[:max_lines]).strip()
 
 
 def _sync_odoo_token(tok: str) -> None:
@@ -536,7 +786,9 @@ def enqueue_job(
     if not task:
         return False, {"ok": False, "error": "Görev metni (task) boş olamaz."}
 
-    cwd_path = Path(os.path.expanduser(DEFAULT_CWD)).resolve()
+    is_odoo_job = (user_id is not None) or bool(source)
+    raw_cwd = ODOO_AI_CWD if is_odoo_job else DEFAULT_CWD
+    cwd_path = Path(os.path.expanduser(raw_cwd)).resolve()
     if not cwd_path.exists() or not cwd_path.is_dir():
         return False, {"ok": False, "error": f"Çalışma dizini bulunamadı: {cwd_path}"}
 
@@ -587,6 +839,8 @@ def enqueue_job(
             meta["user_login"] = str(user_login)
         if source:
             meta["source"] = str(source)
+        if is_odoo_job:
+            meta["scope"] = "eretna"
 
         meta["no"] = _next_emir_no(job_id)
         _save_job_meta(job_id, meta)
@@ -633,6 +887,7 @@ def _job_detail_payload(job_id: str, offset: int = 0) -> tuple[int, dict[str, An
     log_file = _job_log_path(job_id)
     full_output = ""
     result_output = ""
+    result_full = ""
     chunk = ""
     next_offset = max(0, offset)
     if log_file.exists():
@@ -640,7 +895,9 @@ def _job_detail_payload(job_id: str, offset: int = 0) -> tuple[int, dict[str, An
             raw_bytes = log_file.read_bytes()
             raw_str = raw_bytes.decode("utf-8", errors="replace")
             full_output = strip_ansi(raw_str)
-            result_output = extract_result_section(raw_str, bool(meta.get("dry_run")))
+            is_dry = bool(meta.get("dry_run"))
+            result_full = extract_result_section(raw_str, is_dry)
+            result_output = summarize_result(raw_str, dry_run=is_dry, status=meta.get("status"))
             chunk_bytes = raw_bytes[next_offset:]
             chunk = strip_ansi(chunk_bytes.decode("utf-8", errors="replace"))
             next_offset = len(raw_bytes)
@@ -649,11 +906,12 @@ def _job_detail_payload(job_id: str, offset: int = 0) -> tuple[int, dict[str, An
 
     return int(HTTPStatus.OK), {
         "ok": True,
-        "ui_ver": 5,
+        "ui_ver": 8,
         **meta,
         "queue_pos": _queue_positions().get(job_id),
         "output": full_output,
         "result_output": result_output,
+        "result_full": result_full,
         "chunk": chunk,
         "next_offset": next_offset,
     }
@@ -675,7 +933,12 @@ def _list_jobs_for_user(uid: int | None, limit: int = 200) -> dict[str, Any]:
         if log_file.exists():
             try:
                 raw_str = log_file.read_bytes().decode("utf-8", errors="replace")
-                res_sec = extract_result_section(raw_str, bool(j_copy.get("dry_run")))
+                res_sec = summarize_result(
+                    raw_str,
+                    dry_run=bool(j_copy.get("dry_run")),
+                    status=j_copy.get("status"),
+                    max_lines=4,
+                )
                 lines = [ln.strip() for ln in res_sec.splitlines() if ln.strip()]
                 j_copy["summary"] = "\n".join(lines[:4])[:360] if lines else ""
             except OSError:
@@ -683,7 +946,7 @@ def _list_jobs_for_user(uid: int | None, limit: int = 200) -> dict[str, Any]:
         else:
             j_copy["summary"] = ""
         filtered.append(j_copy)
-    return {"ok": True, "ui_ver": 5, "jobs": filtered, "queue_len": len(pos)}
+    return {"ok": True, "ui_ver": 8, "jobs": filtered, "queue_len": len(pos)}
 
 
 def _handle_bridge_request(req: dict[str, Any]) -> dict[str, Any]:
@@ -785,6 +1048,77 @@ def _bridge_loop() -> None:
         time.sleep(0.08)
 
 
+def _build_eretna_bwrap_cmd(
+    cmd: list[str],
+    addon_cwd: Path,
+    report_path: Path | None = None,
+) -> tuple[list[str], Path | None, Any]:
+    """Odoo (#yapayzeka) işlerini yalnızca eretna_bizimhesap diziniyle sınırlayan bubblewrap sarmalayıcısı."""
+    bwrap_bin = shutil.which("bwrap")
+    if not bwrap_bin:
+        return cmd, report_path, (lambda: None)
+
+    sandbox_home = Path(tempfile.mkdtemp(prefix="jrc_eretna_sb_"))
+    (sandbox_home / ".claude").mkdir(parents=True, exist_ok=True)
+    home_dir = Path.home()
+    claude_json = home_dir / ".claude.json"
+    if claude_json.exists():
+        try:
+            shutil.copy2(claude_json, sandbox_home / ".claude.json")
+        except OSError:
+            pass
+
+    sandbox_home_mount = "/home/efe/.sandbox_home"
+    sandbox_report_path: Path | None = None
+
+    bwrap_cmd: list[str] = [
+        bwrap_bin,
+        "--unshare-user", "--unshare-pid", "--unshare-uts", "--unshare-ipc", "--die-with-parent",
+    ]
+    for sys_dir in ("/usr", "/bin", "/lib", "/lib64", "/etc"):
+        if Path(sys_dir).exists():
+            bwrap_cmd.extend(["--ro-bind", sys_dir, sys_dir])
+    resolve_dir = Path("/run/systemd/resolve")
+    if resolve_dir.exists():
+        bwrap_cmd.extend(["--ro-bind", str(resolve_dir), str(resolve_dir)])
+
+    bwrap_cmd.extend([
+        "--dev", "/dev",
+        "--proc", "/proc",
+        "--tmpfs", "/tmp",
+        "--tmpfs", str(home_dir),
+        "--bind", str(sandbox_home), sandbox_home_mount,
+    ])
+
+    creds_file = home_dir / ".claude" / ".credentials.json"
+    if creds_file.exists():
+        bwrap_cmd.extend(["--ro-bind", str(creds_file), f"{sandbox_home_mount}/.claude/.credentials.json"])
+
+    for ro_sub in (".local/bin", ".local/share/claude", ".nvm"):
+        src = home_dir / ro_sub
+        if src.exists():
+            bwrap_cmd.extend(["--ro-bind", str(src), str(src)])
+
+    if report_path is not None:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.touch(exist_ok=True)
+        sb_report = f"{sandbox_home_mount}/jrc_report.md"
+        bwrap_cmd.extend(["--bind", str(report_path), sb_report])
+        sandbox_report_path = Path(sb_report)
+
+    bwrap_cmd.extend([
+        "--bind", str(addon_cwd), str(addon_cwd),
+        "--setenv", "HOME", sandbox_home_mount,
+        "--chdir", str(addon_cwd),
+    ])
+    bwrap_cmd.extend(cmd)
+
+    def _cleanup() -> None:
+        shutil.rmtree(sandbox_home, ignore_errors=True)
+
+    return bwrap_cmd, sandbox_report_path, _cleanup
+
+
 def run_worker(job_id: str) -> int:
     """Arka plan görev işçisi: jrc konsolunun run_agent akışıyla birebir aynı yoldan yürütür."""
     meta = _load_job_meta(job_id)
@@ -794,15 +1128,41 @@ def run_worker(job_id: str) -> int:
 
     task = str(meta.get("task") or "").strip()
     emir_no = meta.get("no") if isinstance(meta.get("no"), int) else None
-    target_cwd = Path(os.path.expanduser(str(meta.get("cwd") or DEFAULT_CWD))).resolve()
+    is_eretna = (
+        meta.get("scope") == "eretna"
+        or meta.get("user_id") is not None
+        or bool(meta.get("source"))
+    )
+    allowed_uid = meta.get("user_id") if is_eretna and isinstance(meta.get("user_id"), int) else None
+    if is_eretna:
+        target_cwd = Path(os.path.expanduser(ODOO_AI_CWD)).resolve()
+    else:
+        target_cwd = Path(os.path.expanduser(str(meta.get("cwd") or DEFAULT_CWD))).resolve()
+
     raw_tool = str(meta.get("tool") or "").strip().lower()
-    forced_tool = raw_tool if raw_tool in ("claude", "agy") else None
+    bwrap_available = bool(shutil.which("bwrap"))
+    if is_eretna:
+        # Sandbox izolasyonu için Odoo işlerinde Claude CLI kullanılır (agy ek keyring/db gerektirir).
+        forced_tool: str | None = "claude"
+        skip_perms = bwrap_available
+        extra_cli_args: list[str] | None = (
+            None
+            if bwrap_available
+            else ["--permission-mode", "dontAsk", "--allowedTools", "Read,Grep,Glob,Edit,Write"]
+        )
+        sys_prompt: str | None = ERETNA_SYSTEM_PROMPT
+    else:
+        forced_tool = raw_tool if raw_tool in ("claude", "agy") else None
+        skip_perms = True
+        extra_cli_args = None
+        sys_prompt = None
+
     dry_run = bool(meta.get("dry_run", False))
     emir_nums = jrc_context.extract_emir_numbers(task)
-    emir_ctx = jrc_context.build_emir_context_block(task) if emir_nums else ""
+    emir_ctx = jrc_context.build_emir_context_block(task, allowed_user_id=allowed_uid) if emir_nums else ""
 
     # Hız: yönetici iş emrini jev kararını beklemeden, analizle paralel yazmaya başlar.
-    prefetch = None if dry_run else jrc_director.start_prefetch(task, target_cwd)
+    prefetch = None if dry_run else jrc_director.start_prefetch(task, target_cwd, allowed_user_id=allowed_uid)
     try:
         print("⚡ Jev görev analizi yapılıyor..." + (" (yönetici iş emri paralel başladı)" if prefetch else ""), flush=True)
         decision = router.analyze_task_with_jev(
@@ -814,10 +1174,16 @@ def run_worker(job_id: str) -> int:
             decision=decision,
             task=task,
             print_mode=True,
-            skip_permissions=True,
+            skip_permissions=skip_perms,
+            extra_args=extra_cli_args,
+            allowed_user_id=allowed_uid,
+            system_prompt=sys_prompt,
         )
         meta["decision"] = decision
         meta["command"] = cmd
+        if is_eretna:
+            meta["scope"] = "eretna"
+            meta["sandbox"] = "bwrap" if bwrap_available else "restricted_tools"
         _save_job_meta(job_id, meta)
 
         m = decision.get("metrics", {})
@@ -837,6 +1203,11 @@ def run_worker(job_id: str) -> int:
             if meta.get("user_name")
             else ""
         )
+        scope_line = (
+            f"  ├─ İzolasyon     : eretna ({'bwrap' if bwrap_available else 'restricted_tools'})\n"
+            if is_eretna
+            else ""
+        )
         ref_line = (
             f"  ├─ Emir Bağlamı  : {', '.join(f'emir{n}' for n in emir_nums)} ({len(emir_ctx)} karakter)\n"
             if emir_nums
@@ -846,6 +1217,7 @@ def run_worker(job_id: str) -> int:
             f"⚡ Jev Router [{decision.get('decision_model', '')} · {decision.get('latency_ms', 0)} ms]\n"
             f"{emir_line}"
             f"{user_line}"
+            f"{scope_line}"
             f"  ├─ Araç & Model  : {decision['tool']} → {decision['model']} ({decision.get('label', '')})\n"
             f"  ├─ Efor & Risk   : effort={decision['effort']} | "
             f"karmaşıklık={m.get('complexity_level', '?')} ({m.get('complexity_score', 0)}) | "
@@ -876,6 +1248,12 @@ def run_worker(job_id: str) -> int:
 
         os.chdir(target_cwd)
 
+        cmd_wrapper = (
+            (lambda c, rp: _build_eretna_bwrap_cmd(c, target_cwd, report_path=rp))
+            if (is_eretna and bwrap_available)
+            else None
+        )
+
         if director_active:
             rc = jrc_director.run(
                 task,
@@ -886,13 +1264,25 @@ def run_worker(job_id: str) -> int:
                     decision=decision,
                     task=task,
                     print_mode=True,
-                    skip_permissions=True,
+                    skip_permissions=skip_perms,
+                    extra_args=extra_cli_args,
                     brief=brief,
+                    allowed_user_id=allowed_uid,
+                    system_prompt=sys_prompt,
                 ),
                 prefetch=prefetch,
+                allowed_user_id=allowed_uid,
+                cmd_wrapper=cmd_wrapper,
             )
         else:
-            rc = subprocess.run(cmd, cwd=str(target_cwd), stdin=subprocess.DEVNULL).returncode
+            if cmd_wrapper is not None:
+                wrapped_cmd, _, cleanup_fn = cmd_wrapper(cmd, None)
+                try:
+                    rc = subprocess.run(wrapped_cmd, cwd=str(target_cwd), stdin=subprocess.DEVNULL).returncode
+                finally:
+                    cleanup_fn()
+            else:
+                rc = subprocess.run(cmd, cwd=str(target_cwd), stdin=subprocess.DEVNULL).returncode
 
         jrc._refresh_tokens_bg()
         try:
@@ -916,6 +1306,333 @@ def run_worker(job_id: str) -> int:
         meta["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         _save_job_meta(job_id, meta)
         return 1
+
+
+_NOTIF_HEADER_RE = re.compile(
+    r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] \[([^\]]+)\] (CEVAP|HATA) \(([^)]+)\)(?: \[belge: ([^\]]+)\])?:\s*$"
+)
+_NOTIF_SECRET_RE = re.compile(r"((?:şifre|sifre|parola|password)\s*[:=]\s*)(\S+)", re.I)
+_NOTIF_BELGE_RE = re.compile(r"\[belge: ([^\]\r\n]+)\]")
+_NOTIF_WHITELIST_LOCK = threading.Lock()
+_NOTIF_WHITELIST_CACHE: dict[str, Any] = {"sig": None, "paths": set()}
+
+
+def _mask_notif_secrets(text: str) -> str:
+    return _NOTIF_SECRET_RE.sub(lambda m: m.group(1) + "••••••", text)
+
+
+def _load_telegram_user_map() -> dict[str, int]:
+    """`kullanici_kayit.chat_id_bul` ile aynı eşlemeyi (username -> chat_id) okur."""
+    try:
+        raw = json.loads(TELEGRAM_USERS_FILE.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            return {str(k).lstrip("@").lower(): int(v) for k, v in raw.items()}
+    except (OSError, ValueError, TypeError):
+        pass
+    return {}
+
+
+def _is_user_recipient(recipient: str, user_map: dict[str, int]) -> bool:
+    """Alıcı bilgisinin hedef kullanıcıya (chat_id 900224672) ait olup olmadığını kontrol eder."""
+    clean = (recipient or "").strip().lstrip("@").lower()
+    if not clean:
+        return False
+    if clean == str(NOTIF_TARGET_CHAT_ID):
+        return True
+    return user_map.get(clean) == NOTIF_TARGET_CHAT_ID
+
+
+def _make_notif_item(
+    *,
+    source: str,
+    time_str: str,
+    ts: float,
+    bot: str,
+    kind: str,
+    recipient: str,
+    text: str,
+    attachment: str | None = None,
+    service: str | None = None,
+) -> dict[str, Any]:
+    clean_text = _mask_notif_secrets((text or "").strip())
+    att_clean = attachment.strip() if attachment else None
+    att_ext = os.path.splitext(att_clean)[1].lower() if att_clean else None
+    att_exists = bool(att_clean and os.path.isfile(os.path.realpath(att_clean)))
+    service_name = (service or "").strip()
+    if not service_name:
+        if source == "openclaw":
+            service_name = "peribot (OpenClaw)"
+        elif source == "hermes":
+            service_name = "Hermes"
+        else:
+            service_name = (bot or source or "bilinmeyen").strip()
+    digest = hashlib.sha1(
+        f"{source}|{time_str}|{bot}|{recipient}|{clean_text[:80]}|{att_clean or ''}".encode("utf-8", errors="ignore")
+    ).hexdigest()[:16]
+    return {
+        "id": digest,
+        "source": source,
+        "service": service_name,
+        "time": time_str,
+        "ts": ts,
+        "bot": bot,
+        "kind": kind,
+        "recipient": recipient,
+        "text": clean_text,
+        "attachment": att_clean,
+        "attachment_name": os.path.basename(att_clean) if att_clean else None,
+        "attachment_ext": att_ext,
+        "attachment_is_image": att_ext in IMAGE_MIME_TYPES if att_ext else False,
+        "attachment_exists": att_exists,
+    }
+
+
+def _parse_ajancevaplari_tail(
+    limit: int = 120,
+    scope: str = "mine",
+    bot_filter: str = "",
+    user_map: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    """`ajancevaplari.txt` dosyasının sonundan okuyarak kayıtları ayrıştırır."""
+    if not AJANCEVAPLARI_FILE.is_file():
+        return []
+    if user_map is None:
+        user_map = _load_telegram_user_map()
+    try:
+        size = AJANCEVAPLARI_FILE.stat().st_size
+        # Sondan yeterli bayt oku; filtre/tüm alıcılar için geniş tampon al
+        read_bytes = min(size, max(512_000, limit * 5_000))
+        with AJANCEVAPLARI_FILE.open("rb") as fh:
+            if size > read_bytes:
+                fh.seek(size - read_bytes)
+            raw = fh.read()
+        content = raw.decode("utf-8", errors="ignore").replace("\r\n", "\n")
+    except OSError:
+        return []
+
+    lines = content.split("\n")
+    # İlk tam başlık satırına kadar kısmi başlangıcı atla
+    start_idx = 0
+    if size > read_bytes:
+        for i, ln in enumerate(lines):
+            if _NOTIF_HEADER_RE.match(ln):
+                start_idx = i
+                break
+        else:
+            return []
+
+    items: list[dict[str, Any]] = []
+    cur_header: tuple[str, str, str, str, str | None] | None = None
+    cur_body: list[str] = []
+
+    def _flush() -> None:
+        if cur_header is None:
+            return
+        t_str, bot_name, kind, recip, att = cur_header
+        if scope != "all" and not _is_user_recipient(recip, user_map):
+            return
+        if bot_filter and bot_name.lower() != bot_filter.lower():
+            return
+        try:
+            ts_val = datetime.strptime(t_str, "%Y-%m-%d %H:%M:%S").timestamp()
+        except ValueError:
+            ts_val = 0.0
+        body_txt = "\n".join(cur_body).strip()
+        items.append(
+            _make_notif_item(
+                source="defter",
+                time_str=t_str,
+                ts=ts_val,
+                bot=bot_name,
+                kind=kind,
+                recipient=recip,
+                text=body_txt,
+                attachment=att,
+            )
+        )
+
+    for ln in lines[start_idx:]:
+        m = _NOTIF_HEADER_RE.match(ln)
+        if m:
+            _flush()
+            cur_header = (m.group(1), m.group(2).strip(), m.group(3), m.group(4).strip(), m.group(5))
+            cur_body = []
+        elif cur_header is not None:
+            cur_body.append(ln)
+    _flush()
+
+    items.reverse()
+    return items[:limit]
+
+
+def _read_openclaw_notifs(limit: int = 40) -> list[dict[str, Any]]:
+    """OpenClaw (`peribot`) yerel SQLite transcript'inden doğrudan Telegram yanıtlarını okur (salt okunur)."""
+    if not OPENCLAW_DEV_DB.is_file():
+        return []
+    out: list[dict[str, Any]] = []
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(f"file:{OPENCLAW_DEV_DB}?mode=ro", uri=True, timeout=1.0)
+        sids = [
+            r[0]
+            for r in conn.execute(
+                """
+                SELECT DISTINCT sw.session_id
+                FROM session_windows sw
+                LEFT JOIN conversations c ON sw.primary_conversation_id = c.conversation_id
+                WHERE sw.channel = 'telegram'
+                  AND (sw.session_key LIKE ? OR c.peer_id = ?)
+                """,
+                (f"%:{NOTIF_TARGET_CHAT_ID}", str(NOTIF_TARGET_CHAT_ID)),
+            ).fetchall()
+            if r[0]
+        ]
+        if not sids:
+            return []
+        placeholders = ",".join("?" for _ in sids)
+        rows = conn.execute(
+            f"""
+            SELECT timestamp, text
+            FROM session_transcript_fts
+            WHERE session_id IN ({placeholders}) AND role = 'assistant'
+            ORDER BY rowid DESC
+            LIMIT ?
+            """,
+            (*sids, max(limit * 3, 60)),
+        ).fetchall()
+        for ts_ms, txt in rows:
+            clean = (txt or "").strip()
+            if not clean or clean == "NO_REPLY" or clean.startswith("OpenClaw stopped this turn:"):
+                continue
+            ts_sec = float(ts_ms) / 1000.0 if float(ts_ms) > 1e12 else float(ts_ms)
+            t_str = datetime.fromtimestamp(ts_sec).strftime("%Y-%m-%d %H:%M:%S")
+            out.append(
+                _make_notif_item(
+                    source="openclaw",
+                    time_str=t_str,
+                    ts=ts_sec,
+                    bot="peribot",
+                    kind="CEVAP",
+                    recipient="@mustafaulker34",
+                    text=clean,
+                    service="peribot (OpenClaw)",
+                )
+            )
+            if len(out) >= limit:
+                break
+    except Exception:
+        return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return out
+
+
+def _read_hermes_notifs(limit: int = 40) -> list[dict[str, Any]]:
+    """Hermes (`~/.hermes/state.db`) üzerinden Telegram'a giden doğrudan yanıtları okur (salt okunur)."""
+    if not HERMES_STATE_DB.is_file():
+        return []
+    out: list[dict[str, Any]] = []
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(f"file:{HERMES_STATE_DB}?mode=ro", uri=True, timeout=1.0)
+        rows = conn.execute(
+            """
+            SELECT m.timestamp, m.content
+            FROM messages m
+            JOIN sessions s ON m.session_id = s.id
+            WHERE s.source = 'telegram'
+              AND s.chat_id = ?
+              AND m.role = 'assistant'
+              AND m.content IS NOT NULL
+              AND m.content != ''
+            ORDER BY m.timestamp DESC
+            LIMIT ?
+            """,
+            (str(NOTIF_TARGET_CHAT_ID), max(limit * 2, 40)),
+        ).fetchall()
+        for ts_val, content in rows:
+            clean = (content or "").strip()
+            if not clean or clean == "Your request was not processed. Send it again if you still want me to carry it out.":
+                continue
+            ts_sec = float(ts_val) / 1000.0 if float(ts_val) > 1e12 else float(ts_val)
+            t_str = datetime.fromtimestamp(ts_sec).strftime("%Y-%m-%d %H:%M:%S")
+            out.append(
+                _make_notif_item(
+                    source="hermes",
+                    time_str=t_str,
+                    ts=ts_sec,
+                    bot="hermes",
+                    kind="CEVAP",
+                    recipient="@mustafaulker34",
+                    text=clean,
+                    service="Hermes",
+                )
+            )
+            if len(out) >= limit:
+                break
+    except Exception:
+        return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return out
+
+
+def _list_notifications(limit: int = 100, scope: str = "mine", bot_filter: str = "") -> dict[str, Any]:
+    limit = max(1, min(int(limit or 100), 300))
+    user_map = _load_telegram_user_map()
+    all_items: list[dict[str, Any]] = []
+    all_items.extend(_parse_ajancevaplari_tail(limit=limit, scope=scope, bot_filter="", user_map=user_map))
+    if scope != "all":
+        all_items.extend(_read_openclaw_notifs(limit=min(limit, 60)))
+        all_items.extend(_read_hermes_notifs(limit=min(limit, 60)))
+
+    bots_seen = sorted({it["bot"] for it in all_items if it.get("bot")})
+    if bot_filter:
+        bf_low = bot_filter.strip().lower()
+        filtered = [it for it in all_items if (it.get("bot") or "").lower() == bf_low]
+    else:
+        filtered = all_items
+
+    filtered.sort(key=lambda x: x.get("ts", 0.0), reverse=True)
+    return {
+        "ok": True,
+        "notifications": filtered[:limit],
+        "bots": bots_seen,
+        "total": len(filtered[:limit]),
+        "scope": scope,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _notif_allowed_attachments() -> set[str]:
+    """Defterde (`ajancevaplari.txt`) geçen belge yollarının gerçek (realpath) beyaz listesini döndürür."""
+    if not AJANCEVAPLARI_FILE.is_file():
+        return set()
+    try:
+        st = AJANCEVAPLARI_FILE.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return set()
+
+    with _NOTIF_WHITELIST_LOCK:
+        if _NOTIF_WHITELIST_CACHE["sig"] == sig:
+            return _NOTIF_WHITELIST_CACHE["paths"]
+        try:
+            text = AJANCEVAPLARI_FILE.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return set()
+        paths = {os.path.realpath(m.strip()) for m in _NOTIF_BELGE_RE.findall(text) if m.strip()}
+        _NOTIF_WHITELIST_CACHE["sig"] = sig
+        _NOTIF_WHITELIST_CACHE["paths"] = paths
+        return paths
 
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -1096,6 +1813,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
     button.primary:hover { background: #2ea043; }
     button.primary:disabled { opacity: 0.55; cursor: not-allowed; }
+    button.secondary {
+      background: var(--panel-alt);
+      color: var(--muted);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 9px 14px;
+      font-size: 14px;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    button.secondary:hover { color: var(--red); border-color: rgba(248,81,73,0.45); background: rgba(248,81,73,0.08); }
     .decision-box {
       display: none;
       background: var(--panel-alt);
@@ -1208,7 +1940,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       border: 1px solid var(--border);
       border-radius: 8px;
       padding: 10px 12px;
-      max-height: 520px;
+      max-height: 1560px;
       overflow-y: auto;
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       font-size: 12.5px;
@@ -1664,6 +2396,93 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       line-height: 1.5;
       margin: 4px 0 10px;
     }
+    .nf-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .nf-card {
+      background: var(--card, var(--panel));
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      transition: border-color .15s ease;
+    }
+    .nf-card.unread {
+      border-color: rgba(56, 189, 248, 0.55);
+      box-shadow: inset 3px 0 0 #38bdf8;
+    }
+    .nf-service {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 14.5px;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      color: var(--text);
+      margin-bottom: 7px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--border);
+    }
+    .nf-service.cyan { color: var(--accent); }
+    .nf-service.green { color: var(--green); }
+    .nf-service.yellow { color: var(--yellow); }
+    .nf-service.red { color: var(--red); }
+    .nf-service.purple { color: var(--purple); }
+    .nf-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .nf-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-size: 12px;
+    }
+    .nf-time {
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+      font-size: 12px;
+    }
+    .nf-body {
+      font-size: 13px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--text);
+    }
+    .nf-body a {
+      color: #38bdf8;
+      text-decoration: underline;
+    }
+    .nf-att {
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px dashed var(--border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .nf-att-name {
+      font-size: 12px;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      word-break: break-all;
+    }
+    .nf-att-thumb {
+      max-width: 140px;
+      max-height: 90px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      cursor: pointer;
+      object-fit: cover;
+    }
   </style>
 </head>
 <body>
@@ -1677,6 +2496,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="nav-tabs" id="mainTabs">
           <button type="button" class="nav-tab active" data-tab="console">⚡ Görev Konsolu</button>
           <button type="button" class="nav-tab" data-tab="tokens">🔥 Token Harcama <span id="tabTokenBadge" class="badge yellow" style="display:none;font-size:11px;padding:1px 6px;"></span></button>
+          <button type="button" class="nav-tab" data-tab="notifs">🔔 Bildirimler <span id="tabNotifBadge" class="badge cyan" style="display:none;font-size:11px;padding:1px 6px;"></span></button>
         </div>
         <div id="statusBadge" class="badge">Hazır</div>
       </div>
@@ -1717,7 +2537,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               <input type="checkbox" id="dryRun" name="dry_run" />
               Dry-run (yalnızca karar testi, komutu çalıştırma)
             </label>
-            <button type="submit" id="submitBtn" class="primary">🚀 Gönder</button>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <button type="button" id="cancelBtn" class="secondary" style="display:none;">✖ Vazgeç</button>
+              <button type="submit" id="submitBtn" class="primary">🚀 Gönder</button>
+            </div>
           </div>
         </form>
 
@@ -1810,21 +2633,51 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
             <div id="tkKota"></div>
           </div>
+          <div class="card">
+            <div class="tk-card-head">
+              <h3>Claude kotası (/usage)</h3>
+            </div>
+            <div id="tkClaudeKota"></div>
+          </div>
         </div>
       </div>
 
       <p class="tk-not" id="tkNot"></p>
     </section>
+
+    <section id="notifPanel" style="display:none;">
+      <div class="card" style="margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;padding:12px 16px;">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+          <strong style="font-size:15px;">🔔 Telegram Bildirimleri</strong>
+          <div class="tk-donem" id="nfBotFilter">
+            <button type="button" data-bot="" class="aktif">Tümü</button>
+          </div>
+          <select id="nfScope" style="width:auto;padding:4px 8px;font-size:12px;">
+            <option value="mine">Bana gelenler</option>
+            <option value="all">Tüm alıcılar (defter)</option>
+          </select>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+          <span class="badge" id="nfSayiRozet">0 kayıt</span>
+          <button type="button" id="nfOkunduBtn" class="chip" style="padding:5px 10px;font-size:12px;">✓ Okundu say</button>
+          <button type="button" id="nfYenile" class="chip" style="padding:5px 10px;font-size:12px;">↻ Yenile</button>
+        </div>
+      </div>
+      <div id="nfList" class="nf-list">
+        <div class="card sub">Yükleniyor...</div>
+      </div>
+    </section>
   </div>
 
   <script>
     const JRC_TOKEN = __JRC_TOKEN_JSON__;
-    const JRC_UI_VER = 5;
+    const JRC_UI_VER = 8;
 
     const taskEl = document.getElementById('task');
     const toolEl = document.getElementById('tool');
     const dryRunEl = document.getElementById('dryRun');
     const submitBtn = document.getElementById('submitBtn');
+    const cancelBtn = document.getElementById('cancelBtn');
     const outputEl = document.getElementById('output');
     const decisionBox = document.getElementById('decisionBox');
     const decisionGrid = document.getElementById('decisionGrid');
@@ -1839,6 +2692,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     let pollTimer = null;
     let startTimeMs = null;
     let allJobs = [];
+
+    function updateCancelVisibility() {
+      cancelBtn.style.display = taskEl.value.trim() ? 'inline-flex' : 'none';
+    }
+
+    taskEl.addEventListener('input', updateCancelVisibility);
+
+    cancelBtn.addEventListener('click', () => {
+      taskEl.value = '';
+      updateCancelVisibility();
+      taskEl.focus();
+    });
+
+    updateCancelVisibility();
 
     taskEl.addEventListener('keydown', (e) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
@@ -1914,30 +2781,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         return '⊘ Sıradan çıkarıldı (iptal).';
       }
       if (data.status === 'running') {
-        if (raw.includes('iş emri hazırlanıyor')) {
+        if (raw.startsWith('⏳')) {
+          return raw;
+        }
+        if (raw.includes('iş emri hazırlanıyor') || raw.includes('iş emri (')) {
           return '⏳ İş emri hazırlandı, yürütücü ajan çalışıyor...';
         }
         if (!raw) {
           return '⏳ Çıktı bekleniyor...';
         }
+        return '⏳ Yürütücü ajan çalışıyor...';
       }
       if (!raw) {
         return '(Çıktı yok)';
       }
-      if (data.dry_run) {
+      if (data.dry_run || data.status === 'error' || data.status === 'cancelled') {
         return raw;
       }
       const cmdMatch = raw.match(/^\\s*└─ Komut\\s*:[^\\n]*\\n+/m);
-      if (cmdMatch) {
-        const idx = cmdMatch.index + cmdMatch[0].length;
-        const tail = raw.slice(idx).trim();
-        if (tail) {
-          const tailLines = tail.split('\\n');
-          return tailLines.length > 40 ? tailLines.slice(-40).join('\\n') : tail;
-        }
-      }
-      const lines = raw.split('\\n');
-      return lines.slice(-40).join('\\n');
+      const baseText = cmdMatch ? raw.slice(cmdMatch.index + cmdMatch[0].length).trim() : raw;
+      const cleanLines = baseText
+        .split('\\n')
+        .map((ln) => ln.trim())
+        .filter((ln) => ln && !ln.startsWith('🎬 Yönetici') && !ln.startsWith('✓ Ajan oturumu tamamlandı.'));
+      return cleanLines.length ? cleanLines.slice(-8).join('\\n') : '(Özet yok)';
     }
 
     function classifyResultLine(line) {
@@ -2058,7 +2925,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       }
       frag.appendChild(bodyDiv);
 
-      const imgPaths = extractImagePaths(resultText);
+      const mediaSource = (typeof data.result_full === 'string' && data.result_full.trim() !== '')
+        ? data.result_full
+        : resultText;
+      const imgPaths = extractImagePaths(mediaSource);
       if (imgPaths.length) {
         const galleryDiv = document.createElement('div');
         galleryDiv.className = 'res-gallery';
@@ -2095,7 +2965,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         frag.appendChild(galleryDiv);
       }
 
-      const pdfPaths = extractPdfPaths(resultText);
+      const pdfPaths = extractPdfPaths(mediaSource);
       if (pdfPaths.length) {
         const filesDiv = document.createElement('div');
         filesDiv.className = 'res-files';
@@ -2353,6 +3223,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             if (!new RegExp('\\\\b' + tag + '\\\\b', 'i').test(v)) {
               taskEl.value = v + (v && !/\\s$/.test(v) ? ' ' : '') + tag + ' ';
             }
+            updateCancelVisibility();
             taskEl.focus();
             const len = taskEl.value.length;
             taskEl.setSelectionRange(len, len);
@@ -2468,6 +3339,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           startTimeMs = null;
           jobTimer.textContent = '';
           taskEl.value = '';
+          updateCancelVisibility();
         }
         loadJobs();
         pollJob(data.id);
@@ -2599,6 +3471,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           }).join('')).join('') + `<small class="sub">ölçüm: ${new Date(q.zaman * 1000).toLocaleString('tr-TR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })} (jrc usage)</small>`
         : '<div class="sub">Kota ölçümü yok (jrc usage).</div>';
 
+      const cq = v.claude_kota;
+      const kotaZaman = ts => new Date(ts * 1000).toLocaleString('tr-TR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+      const kalanSure = iso => {
+        const ms = new Date(iso) - Date.now();
+        if (!(ms > 0)) return 'yenileniyor';
+        const g = Math.floor(ms / 864e5), s = Math.floor(ms % 864e5 / 36e5), d = Math.floor(ms % 36e5 / 6e4);
+        return g ? `${g}g ${s}s` : s ? `${s}s ${d}dk` : `${d}dk`;
+      };
+      document.getElementById('tkClaudeKota').innerHTML = cq && (cq.kovalar || []).length
+        ? (cq.plan ? `<div style="font-weight:700;font-size:13px;margin:4px 0">Claude ${esc(String(cq.plan).toUpperCase())}</div>` : '') +
+          cq.kovalar.map(b => {
+            const kalan = Math.round((b.kalan || 0) * 100);
+            const sifir = b.sifirlanma ? `<small class="sub" style="display:block;margin:-2px 0 6px">sıfırlanma: ${esc(kotaZaman(new Date(b.sifirlanma) / 1000))} (${kalanSure(b.sifirlanma)})</small>` : '';
+            return `<div class="hm-satir"><span>${esc(b.ad)}</span><b>%${kalan} kaldı</b></div><div class="tk-pay"><i style="width:${kalan}%;background:${kalan < 20 ? 'var(--red)' : 'var(--green)'}"></i></div>${sifir}`;
+          }).join('') + `<small class="sub">ölçüm: ${kotaZaman(cq.zaman)} (claude /usage)</small>`
+        : '<div class="sub">Claude kota ölçümü yok (Yenile ile çekilir).</div>';
+
       document.getElementById('tkNot').innerHTML =
         'Kayıt: Claude Code oturumlarının gerçek <code>usage</code> sayaçları (jrc, botlar, elle açılan tüm oturumlar) + maliyet defterindeki agy ve doğrudan API çağrıları. ' +
         'Kalıcı defter bu bilgisayarda <code>~/.cache/jroute/tokens.db</code>; 5 dakikada bir ve her jrc görevinden sonra güncellenir. ' +
@@ -2643,20 +3532,168 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     document.getElementById('tkYenile').addEventListener('click', () => tokenGetir(true));
 
-    function switchTab(tab, updateHash = true) {
-      const isTokens = tab === 'tokens';
-      document.querySelectorAll('#mainTabs .nav-tab').forEach(b => {
-        b.classList.toggle('active', b.dataset.tab === (isTokens ? 'tokens' : 'console'));
+    let nfVeri = null;
+    let nfBot = '';
+    let nfScope = 'mine';
+    const NF_SEEN_KEY = 'jrc_notif_last_seen_ts';
+
+    function nfEsc(s) {
+      return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    function nfFormatText(txt) {
+      const esc = nfEsc(txt || '');
+      return esc.replace(/(https?:\\/\\/[^\\s<]+)/g, url => `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`);
+    }
+
+    function nfBotBadgeClass(bot) {
+      const b = String(bot || '').toLowerCase();
+      if (b === 'peribot') return 'cyan';
+      if (b === 'eretnabot') return 'green';
+      if (b === 'hermes') return 'yellow';
+      if (b === 'geocubot') return 'red';
+      return '';
+    }
+
+    function nfUpdateBadge() {
+      const badgeEl = document.getElementById('tabNotifBadge');
+      if (!badgeEl || !nfVeri || !Array.isArray(nfVeri.notifications)) return;
+      const lastSeen = parseFloat(localStorage.getItem(NF_SEEN_KEY) || '0') || 0;
+      const unread = nfVeri.notifications.filter(n => (n.ts || 0) > lastSeen).length;
+      if (unread > 0) {
+        badgeEl.style.display = 'inline-flex';
+        badgeEl.textContent = String(unread);
+      } else {
+        badgeEl.style.display = 'none';
+      }
+    }
+
+    function markNotifsRead() {
+      if (!nfVeri || !Array.isArray(nfVeri.notifications) || !nfVeri.notifications.length) return;
+      const maxTs = Math.max(...nfVeri.notifications.map(n => n.ts || 0));
+      if (maxTs > 0) {
+        localStorage.setItem(NF_SEEN_KEY, String(maxTs));
+        nfUpdateBadge();
+        notifsCiz();
+      }
+    }
+
+    function notifsCiz() {
+      const listEl = document.getElementById('nfList');
+      const countEl = document.getElementById('nfSayiRozet');
+      const botsEl = document.getElementById('nfBotFilter');
+      if (!nfVeri || !Array.isArray(nfVeri.notifications)) return;
+
+      if (botsEl && Array.isArray(nfVeri.bots)) {
+        const btns = ['<button type="button" data-bot="" class="' + (nfBot === '' ? 'aktif' : '') + '">Tümü</button>'];
+        for (const b of nfVeri.bots) {
+          btns.push(`<button type="button" data-bot="${nfEsc(b)}" class="${nfBot === b ? 'aktif' : ''}">${nfEsc(b)}</button>`);
+        }
+        botsEl.innerHTML = btns.join('');
+        botsEl.querySelectorAll('button').forEach(btn => {
+          btn.addEventListener('click', () => {
+            nfBot = btn.dataset.bot || '';
+            notifsGetir();
+          });
+        });
+      }
+
+      const items = nfVeri.notifications;
+      if (countEl) countEl.textContent = `${items.length} kayıt`;
+      nfUpdateBadge();
+
+      if (!items.length) {
+        listEl.innerHTML = '<div class="card sub">Bu filtrede bildirim bulunamadı.</div>';
+        return;
+      }
+
+      const lastSeen = parseFloat(localStorage.getItem(NF_SEEN_KEY) || '0') || 0;
+      listEl.innerHTML = items.map(n => {
+        const isUnread = (n.ts || 0) > lastSeen;
+        const botCls = nfBotBadgeClass(n.bot);
+        const serviceLabel = n.service || n.bot || 'Servis';
+        const kindBadge = n.kind === 'HATA' ? '<span class="badge red">HATA</span>' : '';
+        let attHtml = '';
+        if (n.attachment) {
+          const encPath = encodeURIComponent(n.attachment);
+          const fileUrl = '/api/notif-file?path=' + encPath;
+          const dlUrl = fileUrl + '&download=1';
+          if (!n.attachment_exists) {
+            attHtml = `<div class="nf-att"><span class="nf-att-name">📎 ${nfEsc(n.attachment_name || n.attachment)}</span><span class="sub">(dosya bulunamadı)</span></div>`;
+          } else if (n.attachment_is_image) {
+            attHtml = `<div class="nf-att">
+              <img class="nf-att-thumb" src="${fileUrl}" alt="${nfEsc(n.attachment_name || 'görsel')}" data-full="${fileUrl}" data-name="${nfEsc(n.attachment)}" />
+              <span class="nf-att-name">${nfEsc(n.attachment_name || n.attachment)}</span>
+              <button type="button" class="chip nf-open-img" data-full="${fileUrl}" data-name="${nfEsc(n.attachment)}">🖼 Aç</button>
+              <a class="chip" href="${dlUrl}" download>⬇ İndir</a>
+            </div>`;
+          } else {
+            attHtml = `<div class="nf-att">
+              <span class="nf-att-name">📄 ${nfEsc(n.attachment_name || n.attachment)}</span>
+              <a class="chip" href="${fileUrl}" target="_blank" rel="noopener noreferrer">📄 Aç</a>
+              <a class="chip" href="${dlUrl}" download>⬇ İndir</a>
+            </div>`;
+          }
+        }
+        return `<div class="nf-card${isUnread ? ' unread' : ''}">
+          <div class="nf-service${botCls ? ' ' + botCls : ''}">📨 ${nfEsc(serviceLabel)}</div>
+          <div class="nf-head">
+            <div class="nf-meta">
+              ${kindBadge}
+              <span class="sub">${nfEsc(n.recipient)}</span>
+            </div>
+            <span class="nf-time">${nfEsc(n.time)}</span>
+          </div>
+          <div class="nf-body">${nfFormatText(n.text || '(yalnızca belge)')}</div>
+          ${attHtml}
+        </div>`;
+      }).join('');
+
+      listEl.querySelectorAll('.nf-att-thumb, .nf-open-img').forEach(el => {
+        el.addEventListener('click', () => openImageLightbox(el.dataset.full, el.dataset.name));
       });
-      document.getElementById('consolePanel').style.display = isTokens ? 'none' : '';
-      document.getElementById('tokenPanel').style.display = isTokens ? 'block' : 'none';
+    }
+
+    async function notifsGetir() {
+      try {
+        const params = new URLSearchParams({ limit: '100', scope: nfScope });
+        if (nfBot) params.set('bot', nfBot);
+        const res = await fetch('/api/notifs?' + params.toString(), {
+          headers: { 'X-JRC-Token': JRC_TOKEN }
+        });
+        const v = await res.json();
+        if (!res.ok || !v.ok) return;
+        nfVeri = v;
+        notifsCiz();
+      } catch (e) {
+        const listEl = document.getElementById('nfList');
+        if (listEl) listEl.innerHTML = '<div class="card sub">Bildirimler yüklenemedi.</div>';
+      }
+    }
+
+    document.getElementById('nfYenile').addEventListener('click', () => notifsGetir());
+    document.getElementById('nfOkunduBtn').addEventListener('click', () => markNotifsRead());
+    document.getElementById('nfScope').addEventListener('change', (e) => {
+      nfScope = e.target.value || 'mine';
+      notifsGetir();
+    });
+
+    function switchTab(tab, updateHash = true) {
+      const target = (tab === 'tokens' || tab === 'notifs') ? tab : 'console';
+      document.querySelectorAll('#mainTabs .nav-tab').forEach(b => {
+        b.classList.toggle('active', b.dataset.tab === target);
+      });
+      document.getElementById('consolePanel').style.display = target === 'console' ? '' : 'none';
+      document.getElementById('tokenPanel').style.display = target === 'tokens' ? 'block' : 'none';
+      document.getElementById('notifPanel').style.display = target === 'notifs' ? 'block' : 'none';
       if (updateHash) {
-        const h = isTokens ? '#tokens' : '';
+        const h = target === 'tokens' ? '#tokens' : (target === 'notifs' ? '#notifs' : '');
         if (location.hash !== h) {
           history.replaceState(null, '', location.pathname + h);
         }
       }
-      if (isTokens) tokenGetir(false);
+      if (target === 'tokens') tokenGetir(false);
+      if (target === 'notifs') notifsGetir();
     }
 
     document.querySelectorAll('#mainTabs .nav-tab').forEach(b => {
@@ -2667,12 +3704,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const h = decodeURIComponent(location.hash.replace(/^#\\/?/, '')).toLowerCase();
       if (h === 'tokens' || h === 'token' || h === 'hermes-token') {
         switchTab('tokens', false);
+      } else if (h === 'notifs' || h === 'notif' || h === 'bildirimler') {
+        switchTab('notifs', false);
       } else if (h === 'console' || h === '') {
         switchTab('console', false);
       }
     }
     window.addEventListener('hashchange', syncHashTab);
     tokenGetir(false);
+    notifsGetir();
+    setInterval(() => notifsGetir(), 15000);
     syncHashTab();
   </script>
 </body>
@@ -2686,6 +3727,30 @@ class JRCWebHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         # Konsolu kirletmemek için yalnız hataları yazdır
         pass
+
+    def _send_inline_file(self, real_target: str, mime: str, is_download: bool) -> None:
+        try:
+            file_bytes = Path(real_target).read_bytes()
+        except OSError:
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "Dosya okunamadı."})
+            return
+        orig_name = os.path.basename(real_target) or "dosya"
+        ascii_name = orig_name.translate(str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU"))
+        ascii_name = re.sub(r"[^\x20-\x7e]", "_", ascii_name).replace('"', "_").replace("\\", "_").strip() or "dosya"
+        utf8_name = urllib.parse.quote(orig_name, safe="")
+        disp_type = "attachment" if is_download else "inline"
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(file_bytes)))
+        self.send_header(
+            "Content-Disposition",
+            f"{disp_type}; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_name}",
+        )
+        self.send_header("Cache-Control", "private, max-age=5")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(file_bytes)
 
     def _send_json(self, status: int, payload: dict[str, Any]) -> None:
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -2832,30 +3897,45 @@ class JRCWebHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "PDF dosyası bulunamadı."})
                 return
 
+            is_download = qs.get("download", ["0"])[0] in ("1", "true", "yes")
+            self._send_inline_file(real_target, "application/pdf", is_download)
+            return
+
+        if path == "/api/notifs":
+            qs = urllib.parse.parse_qs(parsed.query)
             try:
-                file_bytes = Path(real_target).read_bytes()
-            except OSError:
-                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "Dosya okunamadı."})
+                limit = int(qs.get("limit", ["100"])[0])
+            except ValueError:
+                limit = 100
+            scope = (qs.get("scope", ["mine"])[0] or "mine").strip().lower()
+            if scope not in ("mine", "all"):
+                scope = "mine"
+            bot_filter = (qs.get("bot", [""])[0] or "").strip()
+            self._send_json(HTTPStatus.OK, _list_notifications(limit=limit, scope=scope, bot_filter=bot_filter))
+            return
+
+        if path == "/api/notif-file":
+            qs = urllib.parse.parse_qs(parsed.query)
+            raw_file_path = (qs.get("path", [""])[0] or "").strip()
+            if raw_file_path.startswith("file://"):
+                raw_file_path = urllib.parse.unquote(raw_file_path[7:])
+            if not raw_file_path or not raw_file_path.startswith("/") or "\x00" in raw_file_path:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Geçersiz dosya yolu."})
                 return
 
-            orig_name = os.path.basename(real_target) or "dosya.pdf"
-            ascii_name = orig_name.translate(str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU"))
-            ascii_name = re.sub(r"[^\x20-\x7e]", "_", ascii_name).replace('"', "_").replace("\\", "_").strip() or "dosya.pdf"
-            utf8_name = urllib.parse.quote(orig_name, safe="")
-            is_download = qs.get("download", ["0"])[0] in ("1", "true", "yes")
-            disp_type = "attachment" if is_download else "inline"
+            real_target = os.path.realpath(raw_file_path)
+            if real_target not in _notif_allowed_attachments():
+                self._send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "Bu dosya bildirim defterinde kayıtlı değil."})
+                return
 
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "application/pdf")
-            self.send_header("Content-Length", str(len(file_bytes)))
-            self.send_header(
-                "Content-Disposition",
-                f"{disp_type}; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_name}",
-            )
-            self.send_header("Cache-Control", "private, max-age=5")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.end_headers()
-            self.wfile.write(file_bytes)
+            if not os.path.isfile(real_target):
+                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Bildirim dosyası bulunamadı."})
+                return
+
+            ext = os.path.splitext(real_target)[1].lower()
+            mime = NOTIF_MIME_TYPES.get(ext) or mimetypes.guess_type(real_target)[0] or "application/octet-stream"
+            is_download = qs.get("download", ["0"])[0] in ("1", "true", "yes")
+            self._send_inline_file(real_target, mime, is_download)
             return
 
         if path == "/api/jobs":
@@ -2864,7 +3944,7 @@ class JRCWebHandler(BaseHTTPRequestHandler):
             for j in jobs:
                 if j.get("id") in pos:
                     j["queue_pos"] = pos[j["id"]]
-            self._send_json(HTTPStatus.OK, {"ok": True, "ui_ver": 5, "jobs": jobs, "queue_len": len(pos)})
+            self._send_json(HTTPStatus.OK, {"ok": True, "ui_ver": 8, "jobs": jobs, "queue_len": len(pos)})
             return
 
         if path == "/api/tokens":
@@ -2874,6 +3954,10 @@ class JRCWebHandler(BaseHTTPRequestHandler):
             if force_refresh:
                 try:
                     jrc_usage.collect_agy_usage()
+                except Exception:
+                    pass
+                try:
+                    jrc_usage.collect_claude_quota()
                 except Exception:
                     pass
                 try:
@@ -2910,6 +3994,7 @@ class JRCWebHandler(BaseHTTPRequestHandler):
             log_file = _job_log_path(job_id)
             full_output = ""
             result_output = ""
+            result_full = ""
             chunk = ""
             next_offset = offset
             if log_file.exists():
@@ -2917,7 +4002,9 @@ class JRCWebHandler(BaseHTTPRequestHandler):
                     raw_bytes = log_file.read_bytes()
                     raw_str = raw_bytes.decode("utf-8", errors="replace")
                     full_output = strip_ansi(raw_str)
-                    result_output = extract_result_section(raw_str, bool(meta.get("dry_run")))
+                    is_dry = bool(meta.get("dry_run"))
+                    result_full = extract_result_section(raw_str, is_dry)
+                    result_output = summarize_result(raw_str, dry_run=is_dry, status=meta.get("status"))
                     chunk_bytes = raw_bytes[offset:]
                     chunk = strip_ansi(chunk_bytes.decode("utf-8", errors="replace"))
                     next_offset = len(raw_bytes)
@@ -2928,11 +4015,12 @@ class JRCWebHandler(BaseHTTPRequestHandler):
                 HTTPStatus.OK,
                 {
                     "ok": True,
-                    "ui_ver": 5,
+                    "ui_ver": 8,
                     **meta,
                     "queue_pos": _queue_positions().get(job_id),
                     "output": full_output,
                     "result_output": result_output,
+                    "result_full": result_full,
                     "chunk": chunk,
                     "next_offset": next_offset,
                 },

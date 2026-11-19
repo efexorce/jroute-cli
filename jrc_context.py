@@ -134,8 +134,11 @@ def find_emir_by_no(no: int) -> tuple[dict[str, Any] | None, Path | None]:
     return None, None
 
 
-def build_emir_context_block(task: str) -> str:
-    """Görevdeki `emirN` referansları için yürütücüye eklenecek bağlam bloğunu üretir."""
+def build_emir_context_block(task: str, allowed_user_id: int | None = None) -> str:
+    """Görevdeki `emirN` referansları için yürütücüye eklenecek bağlam bloğunu üretir.
+
+    allowed_user_id verilirse (ör. Odoo scope) yalnızca o kullanıcıya ait emirler dahil edilir.
+    """
     nums = extract_emir_numbers(task)
     if not nums:
         return ""
@@ -148,6 +151,9 @@ def build_emir_context_block(task: str) -> str:
         meta, log_path = find_emir_by_no(no)
         if meta is None:
             blocks.append(f"[Önceki emir{no}: emir{no} bulunamadı]")
+            continue
+        if allowed_user_id is not None and meta.get("user_id") != allowed_user_id:
+            blocks.append(f"[Önceki emir{no}: bu emre erişim yetkiniz yok]")
             continue
 
         prev_task = str(meta.get("task") or "").strip()
@@ -203,11 +209,11 @@ def build_emir_context_block(task: str) -> str:
     return joined
 
 
-def resolve_emir_refs(task: str) -> str:
+def resolve_emir_refs(task: str, allowed_user_id: int | None = None) -> str:
     """Görev metninde `emirN` referansı varsa ilgili geçmiş emir bağlamını başa ekler."""
     if not task or task.lstrip().startswith("[Önceki emir"):
         return task
-    ctx_block = build_emir_context_block(task)
+    ctx_block = build_emir_context_block(task, allowed_user_id=allowed_user_id)
     if not ctx_block:
         return task
     return f"{ctx_block}\n\n{task}"

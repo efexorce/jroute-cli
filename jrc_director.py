@@ -151,9 +151,10 @@ def _executor_line(decision: dict[str, Any] | None) -> str:
 
 
 def plan(task: str, decision: dict[str, Any] | None, cwd: Path, session: str | None = None,
-         on_start: Callable[[subprocess.Popen], None] | None = None) -> str:
+         on_start: Callable[[subprocess.Popen], None] | None = None,
+         allowed_user_id: int | None = None) -> str:
     """Yürütücü için iş emrini yöneticiye yazdırır (session verilirse oturum açılır)."""
-    emir_ctx = jrc_context.build_emir_context_block(task)
+    emir_ctx = jrc_context.build_emir_context_block(task, allowed_user_id=allowed_user_id)
     emir_section = f"\nReferans verilen önceki emir bağlamı:\n{emir_ctx}\n" if emir_ctx else ""
     prompt = f"""Sen JEV iş akışının yöneticisisin. Görevi sen YAPMIYORSUN; jrc'nin seçtiği başka bir ajan yapacak.
 Senin işin o ajan için bir iş emri yazmak: işin nasıl yapılacağını sen belirliyorsun.
@@ -189,10 +190,10 @@ class Prefetch:
     (basit görev / yürütücü zaten yönetici model / yönetici kapalı) cancel() süreci öldürür.
     """
 
-    def __init__(self, task: str, cwd: Path) -> None:
+    def __init__(self, task: str, cwd: Path, allowed_user_id: int | None = None) -> None:
         self.session = str(uuid.uuid4()) if config().get("reuse_session", True) else None
         self.started = time.perf_counter()
-        self._task, self._cwd = task, cwd
+        self._task, self._cwd, self._allowed_user_id = task, cwd, allowed_user_id
         self._proc: subprocess.Popen | None = None
         self._cancelled = False
         self._result = ""
@@ -209,7 +210,10 @@ class Prefetch:
 
     def _work(self) -> None:
         try:
-            self._result = plan(self._task, None, self._cwd, session=self.session, on_start=self._on_start)
+            self._result = plan(
+                self._task, None, self._cwd, session=self.session,
+                on_start=self._on_start, allowed_user_id=self._allowed_user_id,
+            )
         except BaseException as exc:  # noqa: BLE001 — iş parçacığında her hata sonuca taşınır
             self._error = exc
 
@@ -228,13 +232,13 @@ class Prefetch:
                 self._proc.kill()
 
 
-def start_prefetch(task: str, cwd: Path) -> Prefetch | None:
+def start_prefetch(task: str, cwd: Path, allowed_user_id: int | None = None) -> Prefetch | None:
     """Yönetici açıksa ve ön-hazırlık izinliyse iş emrini hemen arka planda başlatır."""
     cfg = config()
     if not cfg.get("enabled") or not cfg.get("prefetch", True):
         return None
     try:
-        return Prefetch(task, cwd)
+        return Prefetch(task, cwd, allowed_user_id=allowed_user_id)
     except Exception:
         return None
 
@@ -410,6 +414,8 @@ def run(
     print_mode: bool,
     build_cmd: Callable[[str | None], list[str]],
     prefetch: Prefetch | None = None,
+    allowed_user_id: int | None = None,
+    cmd_wrapper: Callable[[list[str], Path | None], tuple[list[str], Path | None, Callable[[], None] | None]] | None = None,
 ) -> int:
     """Yönetimli çalıştırma: yönetici iş emri → yürütücü → yönetici notu (aynı oturum). Yürütücünün çıkış kodunu döndürür.
 
@@ -425,7 +431,7 @@ def run(
         else:
             session = str(uuid.uuid4()) if config().get("reuse_session", True) else None
             _say("iş emri hazırlanıyor…")
-            work_order = plan(task, decision, cwd, session=session)
+            work_order = plan(task, decision, cwd, session=session, allowed_user_id=allowed_user_id)
     except KeyboardInterrupt:
         if prefetch is not None:
             prefetch.cancel()
@@ -433,17 +439,38 @@ def run(
     except Exception as exc:
         _say(f"\033[33miş emri alınamadı ({str(exc)[:160]}); görev yönetimsiz çalıştırılıyor.\033[0m")
     if not work_order:
-        return subprocess.run(build_cmd(None), cwd=str(cwd)).returncode
+        raw_fallback = build_cmd(None)
+        cleanup_fb: Callable[[], None] | None = None
+        if cmd_wrapper is not None:
+            raw_fallback, _, cleanup_fb = cmd_wrapper(raw_fallback, None)
+        try:
+            return subprocess.run(raw_fallback, cwd=str(cwd)).returncode
+        finally:
+            if cleanup_fb:
+                cleanup_fb()
 
     print(f"\033[2m{work_order}\033[0m\n", file=sys.stderr)
     report_path = new_report_path()
-    cmd = build_cmd(executor_brief(work_order, report_path))
+    cleanup_fn: Callable[[], None] | None = None
+    if cmd_wrapper is not None:
+        report_path.touch(exist_ok=True)
+        _, sandbox_report_path, cleanup_probe = cmd_wrapper([], report_path)
+        if cleanup_probe:
+            cleanup_probe()
+        effective_report = sandbox_report_path or report_path
+        cmd = build_cmd(executor_brief(work_order, effective_report))
+        cmd, _, cleanup_fn = cmd_wrapper(cmd, report_path)
+    else:
+        cmd = build_cmd(executor_brief(work_order, report_path))
 
     exit_code, tail = 130, ""
     try:
         exit_code, tail = _run_executor(cmd, cwd, capture=print_mode)
     except KeyboardInterrupt:
         print(file=sys.stderr)
+    finally:
+        if cleanup_fn:
+            cleanup_fn()
 
     try:
         report = report_path.read_text(encoding="utf-8", errors="replace").strip()
