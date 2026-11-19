@@ -162,6 +162,39 @@ def analyze_task_with_jev(
     forced_tool: str | None = None,
 ) -> dict[str, Any]:
     """TypeSafe Jev SDK üzerinden tek adımda görev analizi ve model seçimi yapar."""
+    # Eğer çağıran çalışma klasörü (örn. odoo / eretnabot) için jrc_policy.json'da pin tanımlıysa
+    # ve kullanıcı görev içinde açıkça başka bir model/araç istemediyse doğrudan pin rotasını döndür.
+    if forced_tool is None and detect_explicit_route_override(task) is None and detect_explicit_tool_override(task, None) is None:
+        try:
+            import jrc_gate
+            pol = jrc_gate.load_policy()
+            sources = pol.get("sources") or {}
+            # odoo çalışma dizininden gelen eretnabot çağrıları
+            src_cfg = sources.get("eretnabot") if "odoo" in cwd.parts or cwd.name == "odoo" else None
+            pin_key = (src_cfg or {}).get("pin")
+            if pin_key and pin_key in ROUTE_PROFILES:
+                pin_eff = (src_cfg or {}).get("effort") or ROUTE_PROFILES[pin_key]["default_effort"]
+                pin_key, sub_from = jrc_gate.substitute_route(pin_key, pol)
+                prof = ROUTE_PROFILES[pin_key]
+                f_tool = prof["tool"]
+                f_model = agy_model_for(prof["model"], pin_eff) if f_tool == "agy" else prof["model"]
+                lbl = prof["label"]
+                if sub_from:
+                    lbl += f" · {sub_from.split('_', 1)[-1]}→{pin_key.split('_', 1)[-1]} (kota ikamesi)"
+                return {
+                    "tool": f_tool,
+                    "model": f_model,
+                    "effort": pin_eff,
+                    "route_key": pin_key,
+                    "label": lbl,
+                    "substituted_from": sub_from,
+                    "latency_ms": 0.0,
+                    "decision_model": "policy_pin",
+                    "metrics": {},
+                }
+        except Exception:
+            pass
+
     ensure_ollaya_running(base_url)
     ws = collect_workspace_context(cwd)
 
@@ -378,14 +411,15 @@ def build_cli_command(
         if print_mode:
             cmd.append("-p")
         cmd.extend(extra)
-        cmd.append(task)
+        cmd.append(jrc_context.resolve_emir_refs(task))
         return cmd
 
     # tool == "agy"
     cmd = ["agy", "--model", model, "--effort", effort]
     if skip_permissions:
         cmd.append("--dangerously-skip-permissions")
-    task_payload = task if ".jrc_context.md" in task else f"[Hafıza: .jrc_context.md] {task}"
+    base_task = task if ".jrc_context.md" in task else f"[Hafıza: .jrc_context.md] {task}"
+    task_payload = jrc_context.resolve_emir_refs(base_task)
     if brief:
         task_payload += brief
     if print_mode:
@@ -488,12 +522,21 @@ def main() -> int:
         return 2
 
     target_cwd = Path(args.cwd).resolve() if args.cwd else Path.cwd()
-    decision = analyze_task_with_jev(
-        task=task_text,
-        cwd=target_cwd,
-        decision_model=args.decision_model,
-        forced_tool=args.tool,
-    )
+    import jrc_director
+    # Hız: yönetici iş emrini jev kararını beklemeden, analizle paralel yazmaya başlar.
+    prefetch = None if (args.json or args.dry_run) else jrc_director.start_prefetch(task_text, target_cwd)
+    try:
+        decision = analyze_task_with_jev(
+            task=task_text,
+            cwd=target_cwd,
+            decision_model=args.decision_model,
+            forced_tool=args.tool,
+        )
+    except BaseException:
+        if prefetch:
+            prefetch.cancel()
+        raise
+    prefetch = jrc_director.resolve_prefetch(prefetch, decision)
     cmd = build_cli_command(
         decision=decision,
         task=task_text,
@@ -511,6 +554,9 @@ def main() -> int:
     print_banner(decision, cmd, cwd=target_cwd)
 
     if args.dry_run:
+        emir_ctx = jrc_context.build_emir_context_block(task_text)
+        if emir_ctx:
+            print(f"\n\033[2m{emir_ctx}\033[0m", file=sys.stderr)
         return 0
 
     # Görev öncesi ortak hafıza katmanını (.jrc_context.md) saf Python ile güncelle
@@ -524,7 +570,6 @@ def main() -> int:
     if args.cwd:
         os.chdir(target_cwd)
 
-    import jrc_director
     if jrc_director.active_for(decision):
         # jrc motoru/modeli seçti; işin nasıl yapılacağını ve hafıza notunu yönetici (Opus) yönetir.
         rc = jrc_director.run(
@@ -533,6 +578,7 @@ def main() -> int:
                 decision=decision, task=task_text, print_mode=args.print_mode,
                 skip_permissions=args.skip_permissions, extra_args=unknown, brief=brief,
             ),
+            prefetch=prefetch,
         )
         try:
             jrc_context.sync_workspace_memory(target_cwd)

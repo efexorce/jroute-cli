@@ -81,6 +81,8 @@ DEFAULT_POLICY: dict[str, Any] = {
         "showcase": {"pin": "agy_argon", "effort": "low", "max_effort": "high"},
         # Yönetim ürün kartı fotoğraf düzenleme & oluşturma (foto_duzenle): Antigravity / Gemini görsel motoru
         "foto_duzenle": {"pin": "agy_argon", "effort": "low", "max_effort": "high"},
+        # Gezegen Radyo mesaj süzgeci: hızlı/ucuz sınıflandırma
+        "gezegenradyo_suzgec": {"pin": "claude_haiku", "effort": "low", "max_effort": "low"},
     },
 }
 
@@ -266,16 +268,26 @@ def decide(
 
     m = re.search(r"\[jrc:([^:\]]+):([^:\]]+):([^\]]+)\]", task or "")
     pin = route if route in ROUTE_PROFILES else sp.get("pin")
-    if m and analyze is not True:
+    # Metinde açık model/araç isteği var mı (ör. "opus ile", "hydrogen ile")?
+    explicit_override = False
+    try:
+        import router as _router  # type: ignore
+        clean_task = re.sub(r"\[(?:jrc:[^\]]+|argon)\]\s*", "", task or "").strip()
+        if _router.detect_explicit_route_override(clean_task) or _router.detect_explicit_tool_override(clean_task, None):
+            explicit_override = True
+    except Exception:
+        pass
+
+    if decision is None and pin and analyze is not True and not explicit_override:
+        decision = _from_profile(pin, effort_hint or sp.get("effort"))
+        mode = "pin"
+    if decision is None and m and analyze is not True:
         tool, model, eff = m.groups()
         rk = next((k for k, v in ROUTE_PROFILES.items() if v["tool"] == tool and model.startswith(v["model"].rsplit("-", 1)[0])), None)
         if rk:
             decision = _from_profile(rk, eff)
             decision["model"] = model if tool == "agy" else decision["model"]
             mode = "etiket"
-    if decision is None and pin and analyze is not True:
-        decision = _from_profile(pin, effort_hint or sp.get("effort"))
-        mode = "pin"
     if decision is None and analyze is False:
         decision = _from_profile(pol.get("fallback_route", "agy_argon"), effort_hint or sp.get("effort"))
         mode = "varsayilan"

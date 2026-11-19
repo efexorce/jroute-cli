@@ -91,6 +91,10 @@ CACHE_DIR = Path.home() / ".cache" / "jroute"
 TOKEN_FILE = CACHE_DIR / "web_token"
 WEB_JOBS_DIR = CACHE_DIR / "web_jobs"
 STATE_FILE = CACHE_DIR / "web_state.json"
+EMIR_SEQ_FILE = CACHE_DIR / "emir_seq.json"
+ODOO_TOKEN_SYNC_FILE = Path("/home/efe/Desktop/jev/projeler/odoo/addons/.jrc_web_token")
+ODOO_BRIDGE_DIR = Path("/home/efe/Desktop/jev/projeler/odoo/addons/.jrc_ai_bridge")
+ODOO_AUDIT_LOG = CACHE_DIR / "odoo_ai_audit.jsonl"
 
 IMAGE_ALLOWED_ROOTS: tuple[str, ...] = (
     "/home/efe/Desktop/jev/artifacts",
@@ -136,6 +140,15 @@ def extract_result_section(raw_text: str, dry_run: bool = False) -> str:
     return "\n".join(lines[-40:])
 
 
+def _sync_odoo_token(tok: str) -> None:
+    try:
+        if ODOO_TOKEN_SYNC_FILE.parent.is_dir():
+            ODOO_TOKEN_SYNC_FILE.write_text(tok + "\n", encoding="utf-8")
+            os.chmod(ODOO_TOKEN_SYNC_FILE, 0o644)
+    except OSError:
+        pass
+
+
 def ensure_token() -> str:
     """~/.cache/jroute/web_token dosyasını 0600 izinle üretir veya okur."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -144,6 +157,7 @@ def ensure_token() -> str:
             tok = TOKEN_FILE.read_text(encoding="utf-8").strip()
             if tok:
                 os.chmod(TOKEN_FILE, 0o600)
+                _sync_odoo_token(tok)
                 return tok
         except OSError:
             pass
@@ -152,6 +166,7 @@ def ensure_token() -> str:
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(tok + "\n")
     os.chmod(TOKEN_FILE, 0o600)
+    _sync_odoo_token(tok)
     return tok
 
 
@@ -196,9 +211,137 @@ def _job_log_path(job_id: str) -> Path:
 def _save_job_meta(job_id: str, meta: dict[str, Any]) -> None:
     WEB_JOBS_DIR.mkdir(parents=True, exist_ok=True)
     p = _job_meta_path(job_id)
-    tmp = p.with_suffix(".json.tmp")
+    tmp = WEB_JOBS_DIR / f".{p.stem}.{os.getpid()}.{threading.get_ident()}.tmp"
     tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     tmp.replace(p)
+
+
+def _load_emir_seq() -> tuple[int, dict[str, int]]:
+    """emir_seq.json dosyasından (seq, {job_id: no}) bilgisini okur."""
+    if not EMIR_SEQ_FILE.exists():
+        return 0, {}
+    try:
+        raw = json.loads(EMIR_SEQ_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0, {}
+    if isinstance(raw, int):
+        return max(0, raw), {}
+    if isinstance(raw, dict):
+        seq_val = raw.get("seq", raw.get("no", 0))
+        seq = int(seq_val) if isinstance(seq_val, (int, float)) else 0
+        assigned_raw = raw.get("assigned")
+        assigned: dict[str, int] = {}
+        if isinstance(assigned_raw, dict):
+            for k, v in assigned_raw.items():
+                if isinstance(v, int) and v > 0:
+                    assigned[str(k)] = v
+        return max(0, seq), assigned
+    return 0, {}
+
+
+def _save_emir_seq(seq: int, assigned: dict[str, int]) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "seq": int(seq),
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "assigned": assigned,
+    }
+    tmp = CACHE_DIR / f".emir_seq.{os.getpid()}.{threading.get_ident()}.tmp"
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(EMIR_SEQ_FILE)
+
+
+def _queued_float(val: Any) -> float:
+    try:
+        return float(val) if val is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def backfill_emir_numbers() -> int:
+    """`no` alanı olmayan eski web_jobs meta kayıtlarını created_at sırasına göre idempotent numaralandırır."""
+    WEB_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    seq, orig_assigned = _load_emir_seq()
+    assigned = dict(orig_assigned)
+    max_no = max([seq, *assigned.values()]) if assigned else seq
+
+    unnumbered: list[tuple[Path, str, dict[str, Any], tuple[float, float] | None]] = []
+    dirty_seq = not EMIR_SEQ_FILE.exists()
+
+    for p in sorted(WEB_JOBS_DIR.glob("*.json")):
+        try:
+            st = p.stat()
+            utimes: tuple[float, float] | None = (st.st_atime, st.st_mtime)
+            meta = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(meta, dict):
+            continue
+
+        jid = str(meta.get("id") or p.stem)
+        existing_no = meta.get("no")
+        if isinstance(existing_no, int) and existing_no > 0:
+            if assigned.get(jid) != existing_no:
+                assigned[jid] = existing_no
+                dirty_seq = True
+            if existing_no > max_no:
+                max_no = existing_no
+            continue
+
+        # Eski bir worker bellekteki eski meta ile dosyayı ezdiyse atanan numarayı geri yükle
+        if jid in assigned and assigned[jid] > 0:
+            restored_no = assigned[jid]
+            meta["no"] = restored_no
+            _save_job_meta(jid, meta)
+            if utimes:
+                try:
+                    os.utime(_job_meta_path(jid), utimes)
+                except OSError:
+                    pass
+            if restored_no > max_no:
+                max_no = restored_no
+            continue
+
+        unnumbered.append((p, jid, meta, utimes))
+
+    if unnumbered:
+        unnumbered.sort(
+            key=lambda item: (
+                str(item[2].get("created_at") or ""),
+                _queued_float(item[2].get("queued_at")),
+                item[1],
+            )
+        )
+        cur = max_no
+        for _p, jid, meta, utimes in unnumbered:
+            cur += 1
+            meta["no"] = cur
+            _save_job_meta(jid, meta)
+            if utimes:
+                try:
+                    os.utime(_job_meta_path(jid), utimes)
+                except OSError:
+                    pass
+            assigned[jid] = cur
+        max_no = cur
+        dirty_seq = True
+
+    if dirty_seq or max_no != seq:
+        _save_emir_seq(max_no, assigned)
+    return max_no
+
+
+def _next_emir_no(job_id: str) -> int:
+    """`_QUEUE_COND` kilidi altında çağrılmalıdır: sayacı 1 artırır ve yeni numarayı döndürür."""
+    if not EMIR_SEQ_FILE.exists():
+        backfill_emir_numbers()
+    seq, assigned = _load_emir_seq()
+    if assigned:
+        seq = max(seq, max(assigned.values()))
+    next_no = seq + 1
+    assigned[job_id] = next_no
+    _save_emir_seq(next_no, assigned)
+    return next_no
 
 
 def _load_job_meta(job_id: str) -> dict[str, Any] | None:
@@ -209,6 +352,14 @@ def _load_job_meta(job_id: str) -> dict[str, Any] | None:
         meta = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    changed = False
+    if not (isinstance(meta.get("no"), int) and meta["no"] > 0):
+        _, assigned = _load_emir_seq()
+        safe_id = p.stem
+        assigned_no = assigned.get(str(meta.get("id") or safe_id)) or assigned.get(safe_id)
+        if isinstance(assigned_no, int) and assigned_no > 0:
+            meta["no"] = assigned_no
+            changed = True
     if meta.get("status") == "running" and meta.get("pid"):
         try:
             os.kill(int(meta["pid"]), 0)
@@ -216,21 +367,30 @@ def _load_job_meta(job_id: str) -> dict[str, Any] | None:
             # Alt süreç beklenmedik şekilde kapandıysa durumu güncelle
             meta["status"] = "error"
             meta["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            _save_job_meta(job_id, meta)
+            changed = True
         except PermissionError:
             pass
+    if changed:
+        _save_job_meta(job_id, meta)
     return meta
 
 
-def list_jobs(limit: int = 25) -> list[dict[str, Any]]:
+def list_jobs(limit: int = 200) -> list[dict[str, Any]]:
     WEB_JOBS_DIR.mkdir(parents=True, exist_ok=True)
-    files = sorted(WEB_JOBS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
     items: list[dict[str, Any]] = []
-    for f in files:
+    for f in WEB_JOBS_DIR.glob("*.json"):
         meta = _load_job_meta(f.stem)
         if meta:
             items.append(meta)
-    return items
+    items.sort(
+        key=lambda m: (
+            int(m.get("no") or 0),
+            str(m.get("created_at") or ""),
+            str(m.get("id") or ""),
+        ),
+        reverse=True,
+    )
+    return items[:limit]
 
 
 # ── Görev kuyruğu (FIFO): aynı anda tek ajan görevi çalışır ─────────────────
@@ -354,6 +514,277 @@ def cancel_queued(job_id: str) -> tuple[bool, str]:
     return True, "İptal edildi."
 
 
+def _record_odoo_audit(entry: dict[str, Any]) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with ODOO_AUDIT_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def enqueue_job(
+    task: str,
+    tool: str = "auto",
+    dry_run: bool = False,
+    user_id: int | None = None,
+    user_name: str | None = None,
+    user_login: str | None = None,
+    source: str | None = None,
+) -> tuple[bool, dict[str, Any]]:
+    task = str(task or "").strip()
+    if not task:
+        return False, {"ok": False, "error": "Görev metni (task) boş olamaz."}
+
+    cwd_path = Path(os.path.expanduser(DEFAULT_CWD)).resolve()
+    if not cwd_path.exists() or not cwd_path.is_dir():
+        return False, {"ok": False, "error": f"Çalışma dizini bulunamadı: {cwd_path}"}
+
+    raw_tool = str(tool or "").strip().lower()
+    norm_tool = raw_tool if raw_tool in ("claude", "agy") else "auto"
+    is_dry = bool(dry_run)
+
+    with _QUEUE_COND:
+        _reap_procs()
+        # Kullanıcı başı eşzamanlı/açık iş sınırı (Hacker Bey id=2 hariç, en çok 2 açık iş)
+        if user_id is not None and int(user_id) != 2 and not is_dry:
+            active_for_user = [
+                m for m in _all_job_metas()
+                if m.get("user_id") == int(user_id) and m.get("status") in ("queued", "running")
+            ]
+            if len(active_for_user) >= 2:
+                return False, {
+                    "ok": False,
+                    "error": "Aynı anda en fazla 2 açık/bekleyen göreviniz olabilir. Lütfen mevcut görevin tamamlanmasını bekleyin veya sıradakini iptal edin.",
+                }
+
+        job_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
+        WEB_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = _job_log_path(job_id)
+        log_path.write_text("", encoding="utf-8")
+
+        meta: dict[str, Any] = {
+            "id": job_id,
+            "task": task,
+            "cwd": str(cwd_path),
+            "tool": norm_tool,
+            "dry_run": is_dry,
+            "status": "queued",
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "queued_at": f"{time.time():.6f}",
+            "started_at": None,
+            "finished_at": None,
+            "exit_code": None,
+            "pid": None,
+            "decision": None,
+            "command": None,
+        }
+        if user_id is not None:
+            meta["user_id"] = int(user_id)
+        if user_name:
+            meta["user_name"] = str(user_name)
+        if user_login:
+            meta["user_login"] = str(user_login)
+        if source:
+            meta["source"] = str(source)
+
+        meta["no"] = _next_emir_no(job_id)
+        _save_job_meta(job_id, meta)
+        if is_dry:
+            _launch_job(meta)
+        else:
+            _dispatch_once()
+        meta = _load_job_meta(job_id) or meta
+        pos = _queue_positions().get(job_id)
+        _QUEUE_COND.notify_all()
+
+    if user_id is not None or source:
+        _record_odoo_audit({
+            "time": meta.get("created_at"),
+            "job_id": job_id,
+            "no": meta.get("no"),
+            "user_id": meta.get("user_id"),
+            "user_name": meta.get("user_name"),
+            "user_login": meta.get("user_login"),
+            "source": meta.get("source") or "jrc_web",
+            "tool": norm_tool,
+            "dry_run": is_dry,
+            "task": task,
+        })
+
+    return True, {
+        "ok": True,
+        "id": job_id,
+        "job_id": job_id,
+        "no": meta.get("no"),
+        "status": meta.get("status"),
+        "queue_pos": pos,
+        "cwd": str(cwd_path),
+        "user_id": meta.get("user_id"),
+        "user_name": meta.get("user_name"),
+    }
+
+
+def _job_detail_payload(job_id: str, offset: int = 0) -> tuple[int, dict[str, Any]]:
+    meta = _load_job_meta(job_id)
+    if not meta:
+        return int(HTTPStatus.NOT_FOUND), {"ok": False, "error": f"İş bulunamadı: {job_id}"}
+
+    log_file = _job_log_path(job_id)
+    full_output = ""
+    result_output = ""
+    chunk = ""
+    next_offset = max(0, offset)
+    if log_file.exists():
+        try:
+            raw_bytes = log_file.read_bytes()
+            raw_str = raw_bytes.decode("utf-8", errors="replace")
+            full_output = strip_ansi(raw_str)
+            result_output = extract_result_section(raw_str, bool(meta.get("dry_run")))
+            chunk_bytes = raw_bytes[next_offset:]
+            chunk = strip_ansi(chunk_bytes.decode("utf-8", errors="replace"))
+            next_offset = len(raw_bytes)
+        except OSError:
+            pass
+
+    return int(HTTPStatus.OK), {
+        "ok": True,
+        "ui_ver": 5,
+        **meta,
+        "queue_pos": _queue_positions().get(job_id),
+        "output": full_output,
+        "result_output": result_output,
+        "chunk": chunk,
+        "next_offset": next_offset,
+    }
+
+
+def _list_jobs_for_user(uid: int | None, limit: int = 200) -> dict[str, Any]:
+    jobs = list_jobs(limit)
+    pos = _queue_positions()
+    filtered: list[dict[str, Any]] = []
+    for j in jobs:
+        if uid is not None and int(uid) != 2:
+            if j.get("user_id") != int(uid):
+                continue
+        j_copy = dict(j)
+        if j_copy.get("id") in pos:
+            j_copy["queue_pos"] = pos[j_copy["id"]]
+        # Kısa özet (kart altında açılır özet için)
+        log_file = _job_log_path(str(j_copy.get("id") or ""))
+        if log_file.exists():
+            try:
+                raw_str = log_file.read_bytes().decode("utf-8", errors="replace")
+                res_sec = extract_result_section(raw_str, bool(j_copy.get("dry_run")))
+                lines = [ln.strip() for ln in res_sec.splitlines() if ln.strip()]
+                j_copy["summary"] = "\n".join(lines[:4])[:360] if lines else ""
+            except OSError:
+                j_copy["summary"] = ""
+        else:
+            j_copy["summary"] = ""
+        filtered.append(j_copy)
+    return {"ok": True, "ui_ver": 5, "jobs": filtered, "queue_len": len(pos)}
+
+
+def _handle_bridge_request(req: dict[str, Any]) -> dict[str, Any]:
+    expected = ensure_token()
+    provided = str(req.get("token") or "").strip()
+    if not provided or not secrets.compare_digest(provided, expected):
+        return {"ok": False, "status_code": 403, "error": "Yetkisiz istek (geçersiz web_token)."}
+
+    action = str(req.get("action") or "").strip().lower()
+    uid_raw = req.get("user_id")
+    uid = int(uid_raw) if isinstance(uid_raw, int) or (isinstance(uid_raw, str) and uid_raw.isdigit()) else None
+    uname = str(req.get("user_name") or "").strip() or None
+    ulogin = str(req.get("user_login") or "").strip() or None
+
+    if action == "run":
+        ok, payload = enqueue_job(
+            task=str(req.get("task") or ""),
+            tool=str(req.get("tool") or "auto"),
+            dry_run=bool(req.get("dry_run", False)),
+            user_id=uid,
+            user_name=uname,
+            user_login=ulogin,
+            source=str(req.get("source") or "odoo_yonetim"),
+        )
+        return {**payload, "status_code": 200 if ok else 400}
+
+    if action == "jobs":
+        return {**_list_jobs_for_user(uid, limit=200), "status_code": 200}
+
+    if action == "job":
+        job_id = str(req.get("id") or req.get("job_id") or "").strip()
+        meta = _load_job_meta(job_id)
+        if not meta:
+            return {"ok": False, "status_code": 404, "error": f"İş bulunamadı: {job_id}"}
+        if uid is not None and uid != 2 and meta.get("user_id") != uid:
+            return {"ok": False, "status_code": 403, "error": "Bu görevi görüntüleme yetkiniz yok."}
+        try:
+            offset = max(0, int(req.get("offset") or 0))
+        except (TypeError, ValueError):
+            offset = 0
+        code, payload = _job_detail_payload(job_id, offset=offset)
+        return {**payload, "status_code": code}
+
+    if action == "cancel":
+        job_id = str(req.get("id") or req.get("job_id") or "").strip()
+        meta = _load_job_meta(job_id)
+        if not meta:
+            return {"ok": False, "status_code": 404, "error": f"İş bulunamadı: {job_id}"}
+        if uid is not None and uid != 2 and meta.get("user_id") != uid:
+            return {"ok": False, "status_code": 403, "error": "Başka kullanıcının görevini iptal edemezsiniz."}
+        ok, msg = cancel_queued(job_id)
+        _kick_queue()
+        return {"ok": ok, "status_code": 200 if ok else 400, "message": msg, "error": None if ok else msg}
+
+    return {"ok": False, "status_code": 400, "error": f"Bilinmeyen köprü komutu: {action}"}
+
+
+def _bridge_loop() -> None:
+    """Odoo Docker konteynerinden (/mnt/extra-addons/.jrc_ai_bridge) gelen istekleri işler."""
+    try:
+        if ODOO_BRIDGE_DIR.parent.is_dir():
+            ODOO_BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
+            os.chmod(ODOO_BRIDGE_DIR, 0o777)
+    except OSError:
+        pass
+    ensure_token()
+    last_clean = 0.0
+    while True:
+        try:
+            if ODOO_BRIDGE_DIR.is_dir():
+                for req_path in sorted(ODOO_BRIDGE_DIR.glob("*.req.json")):
+                    stem = req_path.name[:-len(".req.json")]
+                    res_tmp = ODOO_BRIDGE_DIR / f".{stem}.res.tmp"
+                    res_path = ODOO_BRIDGE_DIR / f"{stem}.res.json"
+                    try:
+                        req_data = json.loads(req_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        req_path.unlink(missing_ok=True)
+                        continue
+                    req_path.unlink(missing_ok=True)
+                    resp = _handle_bridge_request(req_data if isinstance(req_data, dict) else {})
+                    try:
+                        res_tmp.write_text(json.dumps(resp, ensure_ascii=False), encoding="utf-8")
+                        os.chmod(res_tmp, 0o666)
+                        res_tmp.replace(res_path)
+                    except OSError:
+                        pass
+                now = time.time()
+                if now - last_clean > 30:
+                    last_clean = now
+                    for old_f in ODOO_BRIDGE_DIR.glob("*.res.json"):
+                        try:
+                            if now - old_f.stat().st_mtime > 60:
+                                old_f.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+        except Exception as exc:
+            print(f"Odoo AI köprü hatası: {exc}", file=sys.stderr, flush=True)
+        time.sleep(0.08)
+
+
 def run_worker(job_id: str) -> int:
     """Arka plan görev işçisi: jrc konsolunun run_agent akışıyla birebir aynı yoldan yürütür."""
     meta = _load_job_meta(job_id)
@@ -362,13 +793,18 @@ def run_worker(job_id: str) -> int:
         return 1
 
     task = str(meta.get("task") or "").strip()
+    emir_no = meta.get("no") if isinstance(meta.get("no"), int) else None
     target_cwd = Path(os.path.expanduser(str(meta.get("cwd") or DEFAULT_CWD))).resolve()
     raw_tool = str(meta.get("tool") or "").strip().lower()
     forced_tool = raw_tool if raw_tool in ("claude", "agy") else None
     dry_run = bool(meta.get("dry_run", False))
+    emir_nums = jrc_context.extract_emir_numbers(task)
+    emir_ctx = jrc_context.build_emir_context_block(task) if emir_nums else ""
 
+    # Hız: yönetici iş emrini jev kararını beklemeden, analizle paralel yazmaya başlar.
+    prefetch = None if dry_run else jrc_director.start_prefetch(task, target_cwd)
     try:
-        print("⚡ Jev görev analizi yapılıyor...", flush=True)
+        print("⚡ Jev görev analizi yapılıyor..." + (" (yönetici iş emri paralel başladı)" if prefetch else ""), flush=True)
         decision = router.analyze_task_with_jev(
             task=task,
             cwd=target_cwd,
@@ -386,6 +822,7 @@ def run_worker(job_id: str) -> int:
 
         m = decision.get("metrics", {})
         director_active = jrc_director.active_for(decision)
+        prefetch = jrc_director.resolve_prefetch(prefetch, decision)
         director_str = (
             f"açık ({jrc_director.director_name()})"
             if director_active
@@ -394,19 +831,35 @@ def run_worker(job_id: str) -> int:
         cmd_preview = " ".join(
             repr(a[:60] + ("…" if len(a) > 60 else "")) if " " in a else a for a in cmd
         )
+        emir_line = f"  ├─ Emir No       : emir{emir_no}\n" if emir_no else ""
+        user_line = (
+            f"  ├─ Kullanıcı     : {meta.get('user_name')} (uid={meta.get('user_id')})\n"
+            if meta.get("user_name")
+            else ""
+        )
+        ref_line = (
+            f"  ├─ Emir Bağlamı  : {', '.join(f'emir{n}' for n in emir_nums)} ({len(emir_ctx)} karakter)\n"
+            if emir_nums
+            else ""
+        )
         print(
             f"⚡ Jev Router [{decision.get('decision_model', '')} · {decision.get('latency_ms', 0)} ms]\n"
+            f"{emir_line}"
+            f"{user_line}"
             f"  ├─ Araç & Model  : {decision['tool']} → {decision['model']} ({decision.get('label', '')})\n"
             f"  ├─ Efor & Risk   : effort={decision['effort']} | "
             f"karmaşıklık={m.get('complexity_level', '?')} ({m.get('complexity_score', 0)}) | "
             f"kritiklik={m.get('critical_probability', 0)}\n"
             f"  ├─ Yönetici      : {director_str}\n"
+            f"{ref_line}"
             f"  ├─ Çalışma Dizini: {target_cwd}\n"
             f"  └─ Komut         : {cmd_preview}\n",
             flush=True,
         )
 
         if dry_run:
+            if emir_ctx:
+                print(f"{emir_ctx}\n", flush=True)
             print("✓ Dry-run tamamlandı (komut çalıştırılmadı).", flush=True)
             meta["status"] = "done"
             meta["exit_code"] = 0
@@ -416,7 +869,7 @@ def run_worker(job_id: str) -> int:
 
         # Görev öncesi .jrc_context.md ortak hafıza ve gate.jsonl defter kaydı
         try:
-            jrc_context.record_task_and_sync(target_cwd, task, decision)
+            jrc_context.record_task_and_sync(target_cwd, task, decision, no=emir_no)
             jrc_gate.record("jrc", decision, task)
         except Exception as exc:
             print(f"Hafıza/geçit güncellenirken uyarı: {exc}", file=sys.stderr, flush=True)
@@ -436,6 +889,7 @@ def run_worker(job_id: str) -> int:
                     skip_permissions=True,
                     brief=brief,
                 ),
+                prefetch=prefetch,
             )
         else:
             rc = subprocess.run(cmd, cwd=str(target_cwd), stdin=subprocess.DEVNULL).returncode
@@ -454,6 +908,8 @@ def run_worker(job_id: str) -> int:
         return int(rc)
 
     except Exception as exc:
+        if prefetch:
+            prefetch.cancel()
         print(f"\n✗ Görev yürütme hatası: {exc}", file=sys.stderr, flush=True)
         meta["status"] = "error"
         meta["exit_code"] = 1
@@ -468,6 +924,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>JRC Web Konsolu — Jev Router</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230d1117' stroke='%2330363d' stroke-width='2'/%3E%3Ctext x='50%25' y='52%25' dominant-baseline='central' text-anchor='middle' font-family='system-ui,-apple-system,sans-serif' font-weight='800' font-size='42' fill='%2358a6ff'%3EJ%3C/text%3E%3C/svg%3E" />
   <style>
     :root {
       --bg: #0d1117;
@@ -556,7 +1013,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       margin-bottom: 6px;
       color: var(--text);
     }
-    textarea, input[type="text"], select {
+    textarea, input[type="text"], input[type="search"], select {
       width: 100%;
       background: var(--bg);
       color: var(--text);
@@ -567,8 +1024,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       font-family: inherit;
       outline: none;
     }
-    textarea:focus, input[type="text"]:focus, select:focus {
+    textarea:focus, input[type="text"]:focus, input[type="search"]:focus, select:focus {
       border-color: var(--accent);
+    }
+    #jobSearch {
+      padding: 7px 10px;
+      font-size: 12.5px;
+      margin-bottom: 10px;
+      background: var(--panel-alt);
     }
     textarea {
       min-height: 220px;
@@ -696,6 +1159,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       color: var(--muted);
       font-size: 11px;
     }
+    .emir-tag {
+      display: inline-block;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 1px 6px;
+      margin-right: 6px;
+      border-radius: 5px;
+      background: rgba(88, 166, 255, 0.16);
+      color: var(--accent);
+      border: 1px solid rgba(88, 166, 255, 0.35);
+      vertical-align: baseline;
+    }
     .col-mid {
       min-width: 0;
     }
@@ -813,6 +1289,68 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       overflow: hidden;
       text-overflow: ellipsis;
       text-align: center;
+    }
+    .res-files {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .res-file-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 10px;
+      background: var(--panel-alt);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      transition: border-color 0.15s;
+    }
+    .res-file-row:hover {
+      border-color: var(--accent);
+    }
+    .res-file-name {
+      font-size: 12.5px;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
+      flex: 1;
+    }
+    .res-file-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .res-file-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 10px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      text-decoration: none;
+      transition: border-color 0.15s, color 0.15s, background 0.15s;
+    }
+    .res-file-btn:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .res-file-btn.primary {
+      color: var(--accent);
+      border-color: rgba(88, 166, 255, 0.4);
+      background: rgba(88, 166, 255, 0.08);
+    }
+    .res-file-btn.primary:hover {
+      background: rgba(88, 166, 255, 0.16);
+      border-color: var(--accent);
     }
     .img-lightbox {
       position: fixed;
@@ -1150,6 +1688,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <strong style="font-size:14px;">Geçmiş Görevler</strong>
           <button type="button" id="refreshJobsBtn" class="chip">Yenile</button>
         </div>
+        <input type="search" id="jobSearch" placeholder="Görev ara… (metin, emir106, claude, done)" autocomplete="off" />
         <div id="jobList" class="job-list">
           <div class="sub">Yükleniyor...</div>
         </div>
@@ -1280,6 +1819,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   <script>
     const JRC_TOKEN = __JRC_TOKEN_JSON__;
+    const JRC_UI_VER = 5;
 
     const taskEl = document.getElementById('task');
     const toolEl = document.getElementById('tool');
@@ -1291,12 +1831,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     const statusBadge = document.getElementById('statusBadge');
     const jobTimer = document.getElementById('jobTimer');
     const jobListEl = document.getElementById('jobList');
+    const jobSearchEl = document.getElementById('jobSearch');
     const resultStatusBadge = document.getElementById('resultStatusBadge');
     const resultContent = document.getElementById('resultContent');
 
     let activeJobId = null;
     let pollTimer = null;
     let startTimeMs = null;
+    let allJobs = [];
 
     taskEl.addEventListener('keydown', (e) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
@@ -1467,7 +2009,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
       const taskDiv = document.createElement('div');
       taskDiv.className = 'res-task';
-      taskDiv.textContent = (data.dry_run ? '[DRY-RUN] ' : '') + (data.task || '—');
+      if (data.no) {
+        const emirSpan = document.createElement('span');
+        emirSpan.className = 'emir-tag';
+        emirSpan.textContent = `emir${data.no}`;
+        taskDiv.appendChild(emirSpan);
+      }
+      taskDiv.appendChild(document.createTextNode((data.dry_run ? '[DRY-RUN] ' : '') + (data.task || '—')));
       frag.appendChild(taskDiv);
 
       const metaDiv = document.createElement('div');
@@ -1547,12 +2095,70 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         frag.appendChild(galleryDiv);
       }
 
+      const pdfPaths = extractPdfPaths(resultText);
+      if (pdfPaths.length) {
+        const filesDiv = document.createElement('div');
+        filesDiv.className = 'res-files';
+        for (const pdfPath of pdfPaths) {
+          const rowDiv = document.createElement('div');
+          rowDiv.className = 'res-file-row';
+          rowDiv.title = pdfPath;
+
+          const fileName = pdfPath.split('/').pop() || pdfPath;
+          const nameSpan = document.createElement('span');
+          nameSpan.className = 'res-file-name';
+          nameSpan.title = pdfPath;
+          nameSpan.textContent = '📄 ' + fileName;
+
+          const actionsDiv = document.createElement('div');
+          actionsDiv.className = 'res-file-actions';
+
+          const encodedPath = encodeURIComponent(pdfPath);
+          const openLink = document.createElement('a');
+          openLink.className = 'res-file-btn primary';
+          openLink.target = '_blank';
+          openLink.rel = 'noopener';
+          openLink.href = '/api/file?path=' + encodedPath;
+          openLink.textContent = 'Aç';
+
+          const dlLink = document.createElement('a');
+          dlLink.className = 'res-file-btn';
+          dlLink.href = '/api/file?path=' + encodedPath + '&download=1';
+          dlLink.setAttribute('download', fileName);
+          dlLink.textContent = 'İndir';
+
+          actionsDiv.appendChild(openLink);
+          actionsDiv.appendChild(dlLink);
+          rowDiv.appendChild(nameSpan);
+          rowDiv.appendChild(actionsDiv);
+          filesDiv.appendChild(rowDiv);
+        }
+        frag.appendChild(filesDiv);
+      }
+
       resultContent.replaceChildren(frag);
     }
 
     function extractImagePaths(text) {
       if (!text) return [];
       const re = /(?:^|[\\s"'`([<=]|file:\\/\\/)(\\/[A-Za-z0-9_][^\\s"'`<>()\\[\\]*?]*\\.(?:png|jpe?g|webp|gif))/gi;
+      const seen = new Set();
+      const paths = [];
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        let p = m[1];
+        try { p = decodeURIComponent(p); } catch (e) {}
+        if (!seen.has(p)) {
+          seen.add(p);
+          paths.push(p);
+        }
+      }
+      return paths;
+    }
+
+    function extractPdfPaths(text) {
+      if (!text) return [];
+      const re = /(?:^|[\\s"'`([<=]|file:\\/\\/)(\\/[A-Za-z0-9_][^\\s"'`<>()\\[\\]*?]*\\.pdf)/gi;
       const seen = new Set();
       const paths = [];
       let m;
@@ -1637,6 +2243,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         renderDecision(data.decision, data.dry_run);
         renderResult(data);
+        if (data.ui_ver && data.ui_ver !== JRC_UI_VER) {
+          location.reload();
+          return;
+        }
         if (data.status === 'queued') {
           outputEl.textContent = (data.output || '') + `🕒 Sırada bekliyor (#${data.queue_pos || '?'}). Önceki görev bitince otomatik başlayacak.`;
         } else {
@@ -1679,49 +2289,110 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       if (jobId === activeJobId) pollJob(jobId);
     }
 
+    function renderJobs() {
+      if (!allJobs.length) {
+        jobListEl.innerHTML = '<div class="sub">Henüz kayıtlı görev yok.</div>';
+        return;
+      }
+      const q = (jobSearchEl ? jobSearchEl.value : '').trim().toLocaleLowerCase('tr');
+      const filtered = q ? allJobs.filter((j) => {
+        const emir = j.no ? ('emir' + j.no) : '';
+        const decTool = j.decision && j.decision.tool ? j.decision.tool : (j.tool || '');
+        const decModel = j.decision && j.decision.model ? j.decision.model : '';
+        const haystack = [
+          j.task || '',
+          emir,
+          decTool,
+          decModel,
+          decModel ? (decTool + ':' + decModel) : '',
+          j.status || '',
+          j.created_at || ''
+        ].join(' ').toLocaleLowerCase('tr');
+        return haystack.includes(q);
+      }) : allJobs;
+
+      if (!filtered.length) {
+        jobListEl.innerHTML = '<div class="sub">Eşleşen görev yok.</div>';
+        return;
+      }
+
+      jobListEl.innerHTML = '';
+      for (const j of filtered) {
+        const div = document.createElement('div');
+        div.className = 'job-item' + (j.id === activeJobId ? ' active' : '');
+        const tDiv = document.createElement('div');
+        tDiv.className = 'job-task';
+        if (j.no) {
+          const emirSpan = document.createElement('span');
+          emirSpan.className = 'emir-tag';
+          emirSpan.textContent = `emir${j.no}`;
+          tDiv.appendChild(emirSpan);
+        }
+        tDiv.appendChild(document.createTextNode((j.dry_run ? '[DRY] ' : '') + (j.task || '')));
+        const mDiv = document.createElement('div');
+        mDiv.className = 'job-meta';
+        const decTag = j.decision ? `${j.decision.tool}:${j.decision.model}` : (j.tool || 'auto');
+        const stIcon = j.status === 'done' ? '✓' : (j.status === 'running' ? '⏳'
+          : (j.status === 'queued' ? `🕒 #${j.queue_pos || '?'}` : (j.status === 'cancelled' ? '⊘' : '✗')));
+        mDiv.textContent = `${stIcon} ${decTag} · ${(j.created_at || '').slice(5, 16)}`;
+        div.appendChild(tDiv);
+        div.appendChild(mDiv);
+        if (j.status === 'queued') {
+          const cBtn = document.createElement('button');
+          cBtn.type = 'button';
+          cBtn.className = 'chip';
+          cBtn.textContent = '⊘ Sıradan çıkar';
+          cBtn.style.marginTop = '4px';
+          cBtn.addEventListener('click', (ev) => { ev.stopPropagation(); cancelJob(j.id); });
+          div.appendChild(cBtn);
+        }
+        div.addEventListener('click', () => {
+          if (j.no) {
+            const tag = 'emir' + j.no;
+            const v = taskEl.value;
+            if (!new RegExp('\\\\b' + tag + '\\\\b', 'i').test(v)) {
+              taskEl.value = v + (v && !/\\s$/.test(v) ? ' ' : '') + tag + ' ';
+            }
+            taskEl.focus();
+            const len = taskEl.value.length;
+            taskEl.setSelectionRange(len, len);
+          }
+          activeJobId = j.id;
+          startTimeMs = null;
+          pollJob(j.id);
+          loadJobs();
+        });
+        jobListEl.appendChild(div);
+      }
+    }
+
+    if (jobSearchEl) {
+      jobSearchEl.addEventListener('input', renderJobs);
+      jobSearchEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          jobSearchEl.value = '';
+          renderJobs();
+        }
+      });
+    }
+
     async function loadJobs() {
       try {
         const res = await fetch('/api/jobs', {
           headers: { 'X-JRC-Token': JRC_TOKEN }
         });
         const data = await res.json();
-        const jobs = data.jobs || [];
-        if (!jobs.length) {
-          jobListEl.innerHTML = '<div class="sub">Henüz kayıtlı görev yok.</div>';
+        if (data.ui_ver && data.ui_ver !== JRC_UI_VER) {
+          location.reload();
           return;
         }
-        jobListEl.innerHTML = '';
-        for (const j of jobs) {
-          const div = document.createElement('div');
-          div.className = 'job-item' + (j.id === activeJobId ? ' active' : '');
-          const tDiv = document.createElement('div');
-          tDiv.className = 'job-task';
-          tDiv.textContent = (j.dry_run ? '[DRY] ' : '') + (j.task || '');
-          const mDiv = document.createElement('div');
-          mDiv.className = 'job-meta';
-          const decTag = j.decision ? `${j.decision.tool}:${j.decision.model}` : (j.tool || 'auto');
-          const stIcon = j.status === 'done' ? '✓' : (j.status === 'running' ? '⏳'
-            : (j.status === 'queued' ? `🕒 #${j.queue_pos || '?'}` : (j.status === 'cancelled' ? '⊘' : '✗')));
-          mDiv.textContent = `${stIcon} ${decTag} · ${(j.created_at || '').slice(5, 16)}`;
-          div.appendChild(tDiv);
-          div.appendChild(mDiv);
-          if (j.status === 'queued') {
-            const cBtn = document.createElement('button');
-            cBtn.type = 'button';
-            cBtn.className = 'chip';
-            cBtn.textContent = '⊘ Sıradan çıkar';
-            cBtn.style.marginTop = '4px';
-            cBtn.addEventListener('click', (ev) => { ev.stopPropagation(); cancelJob(j.id); });
-            div.appendChild(cBtn);
-          }
-          div.addEventListener('click', () => {
-            activeJobId = j.id;
-            startTimeMs = null;
-            pollJob(j.id);
-            loadJobs();
-          });
-          jobListEl.appendChild(div);
+        allJobs = data.jobs || [];
+        if (!activeJobId && allJobs[0] && allJobs[0].id) {
+          activeJobId = allJobs[0].id;
+          pollJob(activeJobId);
         }
+        renderJobs();
       } catch (e) {
         jobListEl.innerHTML = '<div class="sub">Geçmiş yüklenemedi.</div>';
       }
@@ -1740,6 +2411,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       outputEl.textContent = 'Görev başlatılıyor...';
       renderResult({
         status: 'running',
+        no: null,
         task: task,
         tool: toolEl.value,
         dry_run: dryRunEl.checked,
@@ -1779,6 +2451,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         activeJobId = data.id;
         submitBtn.disabled = false;
+        if (data.no) {
+          renderResult({
+            status: data.status || 'running',
+            no: data.no,
+            queue_pos: data.queue_pos,
+            task: task,
+            tool: toolEl.value,
+            dry_run: dryRunEl.checked,
+            output: data.status === 'queued'
+              ? `🕒 Sırada bekliyor (#${data.queue_pos || '?'}). Önceki görev bitince otomatik başlayacak.`
+              : '⏳ Görev başlatılıyor...'
+          });
+        }
         if (data.status === 'queued') {
           startTimeMs = null;
           jobTimer.textContent = '';
@@ -2115,13 +2800,71 @@ class JRCWebHandler(BaseHTTPRequestHandler):
             self.wfile.write(img_bytes)
             return
 
+        if path == "/api/file":
+            qs = urllib.parse.parse_qs(parsed.query)
+            raw_file_path = (qs.get("path", [""])[0] or "").strip()
+            if raw_file_path.startswith("file://"):
+                raw_file_path = urllib.parse.unquote(raw_file_path[7:])
+            if not raw_file_path or not raw_file_path.startswith("/"):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Geçersiz dosya yolu."})
+                return
+
+            real_target = os.path.realpath(raw_file_path)
+            allowed_reals = [os.path.realpath(r) for r in IMAGE_ALLOWED_ROOTS if r]
+            in_allowed = False
+            for root_real in allowed_reals:
+                try:
+                    if os.path.commonpath([real_target, root_real]) == root_real and real_target != root_real:
+                        in_allowed = True
+                        break
+                except ValueError:
+                    continue
+            if not in_allowed:
+                self._send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "İzinli kök dizin dışında erişim engellendi."})
+                return
+
+            ext = os.path.splitext(real_target)[1].lower()
+            if ext != ".pdf":
+                self._send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "Yalnızca .pdf uzantısına izin verilir."})
+                return
+
+            if not os.path.isfile(real_target):
+                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "PDF dosyası bulunamadı."})
+                return
+
+            try:
+                file_bytes = Path(real_target).read_bytes()
+            except OSError:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "Dosya okunamadı."})
+                return
+
+            orig_name = os.path.basename(real_target) or "dosya.pdf"
+            ascii_name = orig_name.translate(str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU"))
+            ascii_name = re.sub(r"[^\x20-\x7e]", "_", ascii_name).replace('"', "_").replace("\\", "_").strip() or "dosya.pdf"
+            utf8_name = urllib.parse.quote(orig_name, safe="")
+            is_download = qs.get("download", ["0"])[0] in ("1", "true", "yes")
+            disp_type = "attachment" if is_download else "inline"
+
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Length", str(len(file_bytes)))
+            self.send_header(
+                "Content-Disposition",
+                f"{disp_type}; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_name}",
+            )
+            self.send_header("Cache-Control", "private, max-age=5")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(file_bytes)
+            return
+
         if path == "/api/jobs":
-            jobs = list_jobs(25)
+            jobs = list_jobs(200)
             pos = _queue_positions()
             for j in jobs:
                 if j.get("id") in pos:
                     j["queue_pos"] = pos[j["id"]]
-            self._send_json(HTTPStatus.OK, {"ok": True, "jobs": jobs, "queue_len": len(pos)})
+            self._send_json(HTTPStatus.OK, {"ok": True, "ui_ver": 5, "jobs": jobs, "queue_len": len(pos)})
             return
 
         if path == "/api/tokens":
@@ -2185,6 +2928,7 @@ class JRCWebHandler(BaseHTTPRequestHandler):
                 HTTPStatus.OK,
                 {
                     "ok": True,
+                    "ui_ver": 5,
                     **meta,
                     "queue_pos": _queue_positions().get(job_id),
                     "output": full_output,
@@ -2224,66 +2968,22 @@ class JRCWebHandler(BaseHTTPRequestHandler):
             _kick_queue()
             return
 
-        task = str(data.get("task") or "").strip()
-        if not task:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Görev metni (task) boş olamaz."})
-            return
+        uid_raw = data.get("user_id")
+        uid = int(uid_raw) if isinstance(uid_raw, int) or (isinstance(uid_raw, str) and uid_raw.isdigit()) else None
+        uname = str(data.get("user_name") or "").strip() or None
+        ulogin = str(data.get("user_login") or "").strip() or None
+        src = str(data.get("source") or "").strip() or None
 
-        cwd_path = Path(os.path.expanduser(DEFAULT_CWD)).resolve()
-        if not cwd_path.exists() or not cwd_path.is_dir():
-            self._send_json(
-                HTTPStatus.BAD_REQUEST,
-                {"ok": False, "error": f"Çalışma dizini bulunamadı: {cwd_path}"},
-            )
-            return
-
-        raw_tool = str(data.get("tool") or "").strip().lower()
-        tool = raw_tool if raw_tool in ("claude", "agy") else "auto"
-        dry_run = bool(data.get("dry_run", False))
-
-        job_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
-        WEB_JOBS_DIR.mkdir(parents=True, exist_ok=True)
-        log_path = _job_log_path(job_id)
-        log_path.write_text("", encoding="utf-8")
-
-        meta: dict[str, Any] = {
-            "id": job_id,
-            "task": task,
-            "cwd": str(cwd_path),
-            "tool": tool,
-            "dry_run": dry_run,
-            "status": "queued",
-            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "queued_at": f"{time.time():.6f}",
-            "started_at": None,
-            "finished_at": None,
-            "exit_code": None,
-            "pid": None,
-            "decision": None,
-            "command": None,
-        }
-        with _QUEUE_COND:
-            _save_job_meta(job_id, meta)
-            if dry_run:
-                # Dry-run ajan çalıştırmaz; sırayı beklemeden hemen yürür
-                _launch_job(meta)
-            else:
-                _dispatch_once()
-            meta = _load_job_meta(job_id) or meta
-            pos = _queue_positions().get(job_id)
-            _QUEUE_COND.notify_all()
-
-        self._send_json(
-            HTTPStatus.OK,
-            {
-                "ok": True,
-                "id": job_id,
-                "job_id": job_id,
-                "status": meta.get("status"),
-                "queue_pos": pos,
-                "cwd": str(cwd_path),
-            },
+        ok, payload = enqueue_job(
+            task=str(data.get("task") or ""),
+            tool=str(data.get("tool") or "auto"),
+            dry_run=bool(data.get("dry_run", False)),
+            user_id=uid,
+            user_name=uname,
+            user_login=ulogin,
+            source=src,
         )
+        self._send_json(HTTPStatus.OK if ok else HTTPStatus.BAD_REQUEST, payload)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2310,7 +3010,10 @@ def main(argv: list[str] | None = None) -> int:
 
     tok = ensure_token()
     WEB_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    with _QUEUE_COND:
+        backfill_emir_numbers()
     threading.Thread(target=_dispatcher_loop, name="jrc-queue", daemon=True).start()
+    threading.Thread(target=_bridge_loop, name="jrc-odoo-bridge", daemon=True).start()
 
     try:
         server = ThreadingHTTPServer((HOST, args.port), JRCWebHandler)

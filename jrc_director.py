@@ -18,8 +18,11 @@ Token tasarrufu (oturum yönetimi):
   - Basit görevlerde (efor low veya haiku/flash rotası) yönetici hiç çağrılmaz;
     yürütücü notu kendi yazar (skip_trivial).
 
+Hız (prefetch): iş emri jrc kararını BEKLEMEZ; görev gelince start_prefetch() ile karar analiziyle
+  paralel başlar. Karar yöneticiyi gerektirmezse resolve_prefetch() süreci öldürür.
+
 Ayar: jrc_policy.json → "director": {"enabled", "model", "effort", "timeout_s",
-      "skip_trivial", "reuse_session"}
+      "skip_trivial", "reuse_session", "prefetch"}
       (`jrc director on|off`). Yalnızca standart kütüphane kullanır.
 """
 
@@ -29,6 +32,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -43,7 +47,7 @@ import jrc_gate  # noqa: E402
 
 DEFAULTS: dict[str, Any] = {
     "enabled": True, "model": "opus", "effort": "medium", "timeout_s": 300,
-    "skip_trivial": True, "reuse_session": True,
+    "skip_trivial": True, "reuse_session": True, "prefetch": True,
 }
 TRIVIAL_ROUTES = {"claude_haiku", "agy_flash"}
 REPORT_DIR = Path.home() / ".cache" / "jroute" / "reports"
@@ -96,10 +100,12 @@ def active_for(decision: dict[str, Any]) -> bool:
     return not (decision.get("tool") == "claude" and _is_director_model(decision.get("model", ""), cfg))
 
 
-def _ask_director(prompt: str, cwd: Path, task: str, session: str | None = None, resume: bool = False) -> str:
+def _ask_director(prompt: str, cwd: Path, task: str, session: str | None = None, resume: bool = False,
+                  on_start: Callable[[subprocess.Popen], None] | None = None) -> str:
     """Yönetici modeli salt-okunur araçlarla tek seferlik çalıştırır; yanıt metnini döndürür.
 
     session verilirse: resume=False → o kimlikle yeni oturum açar; resume=True → o oturuma devam eder.
+    on_start(proc): süreç başlayınca çağrılır (ön-hazırlığın iptal edilebilmesi için).
     """
     cfg = config()
     cmd = [
@@ -111,13 +117,21 @@ def _ask_director(prompt: str, cwd: Path, task: str, session: str | None = None,
     else:
         cmd.append("--no-session-persistence")
     t0 = time.perf_counter()
-    proc = subprocess.run(
-        cmd, input=prompt, capture_output=True, text=True, cwd=str(cwd),
-        timeout=float(cfg["timeout_s"]), env={**os.environ, "JEV_ORIGIN": "1"},
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        cwd=str(cwd), env={**os.environ, "JEV_ORIGIN": "1"},
     )
-    out = (proc.stdout or "").strip()
+    if on_start:
+        on_start(proc)
+    try:
+        stdout, stderr = proc.communicate(prompt, timeout=float(cfg["timeout_s"]))
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    out = (stdout or "").strip()
     if proc.returncode != 0 or not out:
-        raise RuntimeError((proc.stderr or out or f"claude çıkış kodu {proc.returncode}").strip()[:300])
+        raise RuntimeError((stderr or out or f"claude çıkış kodu {proc.returncode}").strip()[:300])
     try:
         jrc_gate.record(
             "director",
@@ -130,12 +144,17 @@ def _ask_director(prompt: str, cwd: Path, task: str, session: str | None = None,
     return out
 
 
-def _executor_line(decision: dict[str, Any]) -> str:
+def _executor_line(decision: dict[str, Any] | None) -> str:
+    if not decision:
+        return "henüz seçilmedi (jrc paralel olarak claude veya agy seçecek) — iş emrini ajandan bağımsız yaz"
     return f"{decision.get('tool')} · {decision.get('model')} · efor {decision.get('effort')}"
 
 
-def plan(task: str, decision: dict[str, Any], cwd: Path, session: str | None = None) -> str:
+def plan(task: str, decision: dict[str, Any] | None, cwd: Path, session: str | None = None,
+         on_start: Callable[[subprocess.Popen], None] | None = None) -> str:
     """Yürütücü için iş emrini yöneticiye yazdırır (session verilirse oturum açılır)."""
+    emir_ctx = jrc_context.build_emir_context_block(task)
+    emir_section = f"\nReferans verilen önceki emir bağlamı:\n{emir_ctx}\n" if emir_ctx else ""
     prompt = f"""Sen JEV iş akışının yöneticisisin. Görevi sen YAPMIYORSUN; jrc'nin seçtiği başka bir ajan yapacak.
 Senin işin o ajan için bir iş emri yazmak: işin nasıl yapılacağını sen belirliyorsun.
 
@@ -146,7 +165,7 @@ Kullanıcının görevi:
 <gorev>
 {task}
 </gorev>
-
+{emir_section}
 Önce bu dizindeki `.jrc_context.md` dosyasını (varsa) oku; görevle ilgili önceki kararlar ve kurallar orada.
 Gerekiyorsa ilgili dosyalara bak (yalnızca okuma araçların var). Emin olmadığın şeyi kesinmiş gibi yazma;
 "şunu doğrula" diye yürütücüye bırak.
@@ -160,7 +179,74 @@ Yürütücü senin gördüklerini görmeyecek, yalnızca yazdığın metni ve g�
 Token bütçesi sınırlı: yalnızca gerçekten gereken dosyaları aç, büyük dosyalarda Grep ile hedefe git.
 Görev basitse iş emri de birkaç satır olsun; adım uydurma. En fazla 30 satır.
 Yalnızca iş emrini yaz: giriş cümlesi, açıklama ya da soru ekleme."""
-    return _ask_director(prompt, cwd, task, session=session)[:PLAN_LIMIT]
+    return _ask_director(prompt, cwd, task, session=session, on_start=on_start)[:PLAN_LIMIT]
+
+
+class Prefetch:
+    """İş emrini jrc kararıyla PARALEL hazırlar: görev gelir gelmez yönetici yazmaya başlar.
+
+    Karar geldiğinde yönetici gerekiyorsa run(prefetch=...) sonucu bekler; gerekmiyorsa
+    (basit görev / yürütücü zaten yönetici model / yönetici kapalı) cancel() süreci öldürür.
+    """
+
+    def __init__(self, task: str, cwd: Path) -> None:
+        self.session = str(uuid.uuid4()) if config().get("reuse_session", True) else None
+        self.started = time.perf_counter()
+        self._task, self._cwd = task, cwd
+        self._proc: subprocess.Popen | None = None
+        self._cancelled = False
+        self._result = ""
+        self._error: BaseException | None = None
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._work, daemon=True)
+        self._thread.start()
+
+    def _on_start(self, proc: subprocess.Popen) -> None:
+        with self._lock:
+            self._proc = proc
+            if self._cancelled:
+                proc.kill()
+
+    def _work(self) -> None:
+        try:
+            self._result = plan(self._task, None, self._cwd, session=self.session, on_start=self._on_start)
+        except BaseException as exc:  # noqa: BLE001 — iş parçacığında her hata sonuca taşınır
+            self._error = exc
+
+    def result(self) -> str:
+        """İş emrini bekler ve döndürür; hata varsa yükseltir."""
+        while self._thread.is_alive():
+            self._thread.join(0.2)  # Ctrl+C ana iş parçacığında yakalanabilsin
+        if self._error:
+            raise self._error
+        return self._result
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._cancelled = True
+            if self._proc and self._proc.poll() is None:
+                self._proc.kill()
+
+
+def start_prefetch(task: str, cwd: Path) -> Prefetch | None:
+    """Yönetici açıksa ve ön-hazırlık izinliyse iş emrini hemen arka planda başlatır."""
+    cfg = config()
+    if not cfg.get("enabled") or not cfg.get("prefetch", True):
+        return None
+    try:
+        return Prefetch(task, cwd)
+    except Exception:
+        return None
+
+
+def resolve_prefetch(pf: Prefetch | None, decision: dict[str, Any]) -> Prefetch | None:
+    """Karar geldi: yönetici gerekmiyorsa ön-hazırlığı iptal eder; gerekiyorsa onu döndürür."""
+    if pf is None:
+        return None
+    if active_for(decision):
+        return pf
+    pf.cancel()
+    return None
 
 
 def new_report_path() -> Path:
@@ -323,17 +409,26 @@ def run(
     cwd: Path,
     print_mode: bool,
     build_cmd: Callable[[str | None], list[str]],
+    prefetch: Prefetch | None = None,
 ) -> int:
     """Yönetimli çalıştırma: yönetici iş emri → yürütücü → yönetici notu (aynı oturum). Yürütücünün çıkış kodunu döndürür.
 
     build_cmd(brief) seçilen yürütücünün komutunu üretir; brief=None yönetimsiz (eski) komuttur.
     """
     work_order = ""
-    session = str(uuid.uuid4()) if config().get("reuse_session", True) else None
     try:
-        _say("iş emri hazırlanıyor…")
-        work_order = plan(task, decision, cwd, session=session)
+        if prefetch is not None:
+            session = prefetch.session
+            waited = time.perf_counter() - prefetch.started
+            _say(f"iş emri (karar ile paralel, {waited:.0f} sn önce başladı) bekleniyor…")
+            work_order = prefetch.result()
+        else:
+            session = str(uuid.uuid4()) if config().get("reuse_session", True) else None
+            _say("iş emri hazırlanıyor…")
+            work_order = plan(task, decision, cwd, session=session)
     except KeyboardInterrupt:
+        if prefetch is not None:
+            prefetch.cancel()
         raise
     except Exception as exc:
         _say(f"\033[33miş emri alınamadı ({str(exc)[:160]}); görev yönetimsiz çalıştırılıyor.\033[0m")

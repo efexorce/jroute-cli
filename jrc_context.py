@@ -72,6 +72,146 @@ IGNORE_EXTENSIONS = {
 USER_NOTES_START = "<!-- USER_NOTES_START -->"
 USER_NOTES_END = "<!-- USER_NOTES_END -->"
 
+CACHE_DIR = Path.home() / ".cache" / "jroute"
+WEB_JOBS_DIR = CACHE_DIR / "web_jobs"
+EMIR_SEQ_FILE = CACHE_DIR / "emir_seq.json"
+EMIR_REF_RE = re.compile(r"\bem(?:i|İ|ı)r\s*(\d+)\b", re.IGNORECASE)
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\r")
+EMIR_LOG_MAX_LINES = 60
+EMIR_CONTEXT_MAX_CHARS = 4000
+
+
+def extract_emir_numbers(task: str) -> list[int]:
+    """Görev metnindeki `emirN` referanslarını sırasını koruyarak tekilleştirilmiş olarak döndürür."""
+    if not task or task.lstrip().startswith("[Önceki emir"):
+        return []
+    nums: list[int] = []
+    seen: set[int] = set()
+    for m in EMIR_REF_RE.finditer(task):
+        try:
+            n = int(m.group(1))
+        except ValueError:
+            continue
+        if n not in seen:
+            seen.add(n)
+            nums.append(n)
+    return nums
+
+
+def find_emir_by_no(no: int) -> tuple[dict[str, Any] | None, Path | None]:
+    """Verilen emir numarasına ait web_jobs meta sözlüğünü ve log yolunu bulur."""
+    if not WEB_JOBS_DIR.exists():
+        return None, None
+
+    # 1. Hızlı arama: emir_seq.json içindeki job_id -> no eşleşmesi
+    if EMIR_SEQ_FILE.exists():
+        try:
+            seq_data = json.loads(EMIR_SEQ_FILE.read_text(encoding="utf-8"))
+            if isinstance(seq_data, dict):
+                assigned = seq_data.get("assigned")
+                if isinstance(assigned, dict):
+                    for jid, assigned_no in assigned.items():
+                        if assigned_no == no:
+                            safe_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(jid))
+                            meta_path = WEB_JOBS_DIR / f"{safe_id}.json"
+                            if meta_path.exists():
+                                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                                if isinstance(meta, dict):
+                                    meta.setdefault("no", no)
+                                    return meta, WEB_JOBS_DIR / f"{safe_id}.log"
+        except (OSError, ValueError):
+            pass
+
+    # 2. Yedek arama: tüm meta dosyalarını tara
+    for meta_path in WEB_JOBS_DIR.glob("*.json"):
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(meta, dict) and meta.get("no") == no:
+            return meta, WEB_JOBS_DIR / f"{meta_path.stem}.log"
+
+    return None, None
+
+
+def build_emir_context_block(task: str) -> str:
+    """Görevdeki `emirN` referansları için yürütücüye eklenecek bağlam bloğunu üretir."""
+    nums = extract_emir_numbers(task)
+    if not nums:
+        return ""
+
+    # Toplam eklentiyi ~4000 karakter altında tutacak şekilde log bütçesi ayarla
+    per_log_budget = max(350, (EMIR_CONTEXT_MAX_CHARS - 320 * len(nums)) // len(nums))
+    blocks: list[str] = []
+
+    for no in nums:
+        meta, log_path = find_emir_by_no(no)
+        if meta is None:
+            blocks.append(f"[Önceki emir{no}: emir{no} bulunamadı]")
+            continue
+
+        prev_task = str(meta.get("task") or "").strip()
+        if len(prev_task) > 360:
+            prev_task = prev_task[:360] + "…"
+
+        status = str(meta.get("status") or "unknown")
+        if meta.get("dry_run"):
+            status += " (dry-run)"
+        if meta.get("exit_code") is not None:
+            status += f", çıkış={meta['exit_code']}"
+
+        dec = meta.get("decision") if isinstance(meta.get("decision"), dict) else {}
+        if dec and dec.get("tool"):
+            tool_model = f"{dec.get('tool')}/{dec.get('model', '-')}"
+        else:
+            tool_model = str(meta.get("tool") or "auto")
+
+        finished = str(
+            meta.get("finished_at")
+            or meta.get("started_at")
+            or meta.get("created_at")
+            or "-"
+        )
+
+        log_tail = "(log çıktısı yok)"
+        if log_path is not None and log_path.exists():
+            try:
+                raw_log = log_path.read_bytes().decode("utf-8", errors="replace")
+                clean_log = ANSI_ESCAPE_RE.sub("", raw_log).strip()
+                if clean_log:
+                    lines = clean_log.splitlines()
+                    tail_str = "\n".join(lines[-EMIR_LOG_MAX_LINES:]).strip()
+                    if len(tail_str) > per_log_budget:
+                        tail_str = "…(kısaltıldı)\n" + tail_str[-(per_log_budget - 15):]
+                    log_tail = tail_str
+                else:
+                    log_tail = "(log çıktısı boş)"
+            except OSError:
+                log_tail = "(log okunamadı)"
+
+        blocks.append(
+            f"[Önceki emir{no}: durum={status} | araç/model={tool_model} | bitiş={finished}]\n"
+            f"Görev: {prev_task}\n"
+            f"Son çıktı (~{EMIR_LOG_MAX_LINES} satır):\n"
+            f"{log_tail}\n"
+            f"[/Önceki emir{no}]"
+        )
+
+    joined = "\n\n".join(blocks)
+    if len(joined) > EMIR_CONTEXT_MAX_CHARS:
+        joined = joined[: EMIR_CONTEXT_MAX_CHARS - 20].rstrip() + "\n…(kısaltıldı)]"
+    return joined
+
+
+def resolve_emir_refs(task: str) -> str:
+    """Görev metninde `emirN` referansı varsa ilgili geçmiş emir bağlamını başa ekler."""
+    if not task or task.lstrip().startswith("[Önceki emir"):
+        return task
+    ctx_block = build_emir_context_block(task)
+    if not ctx_block:
+        return task
+    return f"{ctx_block}\n\n{task}"
+
 
 def scan_project_files(cwd: Path) -> dict[str, dict[str, Any]]:
     """
@@ -285,6 +425,13 @@ def generate_context_markdown(
     if task_history:
         history_rows = []
         for t in task_history:
+            raw_no = t.get("no")
+            if isinstance(raw_no, int) and raw_no > 0:
+                no_str = f"`emir{raw_no}`"
+            elif isinstance(raw_no, str) and raw_no.strip():
+                no_str = raw_no.strip()
+            else:
+                no_str = "-"
             timestamp = t.get("timestamp", "-")
             tool_name = t.get("tool", "-")
             model_name = t.get("model", "-")
@@ -292,11 +439,11 @@ def generate_context_markdown(
             raw_task = t.get("task", "").replace("\n", " ").replace("|", "/")
             short_task = (raw_task[:65] + "…") if len(raw_task) > 65 else raw_task
             history_rows.append(
-                f"| {timestamp} | `{tool_name}` ({model_name}) | `{effort}` | {short_task} |"
+                f"| {no_str} | {timestamp} | `{tool_name}` ({model_name}) | `{effort}` | {short_task} |"
             )
         history_table = (
-            "| Zaman | Araç & Model | Efor | Görev / Prompt |\n"
-            "| :--- | :--- | :--- | :--- |\n" + "\n".join(history_rows)
+            "| # | Zaman | Araç & Model | Efor | Görev / Prompt |\n"
+            "| :--- | :--- | :--- | :--- | :--- |\n" + "\n".join(history_rows)
         )
     else:
         history_table = "_Henüz kayıtlı görev geçmişi yok._"
@@ -443,16 +590,19 @@ def record_task_and_sync(
     cwd: Path,
     task: str,
     decision: dict[str, Any],
+    no: int | None = None,
 ) -> Path:
     """Görev çalıştırma öncesinde görevi hafızaya ekler ve dosyayı günceller."""
     now_str = datetime.datetime.now().strftime("%d.%m %H:%M")
-    entry = {
+    entry: dict[str, Any] = {
         "timestamp": now_str,
         "tool": decision.get("tool", "unknown"),
         "model": decision.get("model", "unknown"),
         "effort": decision.get("effort", "medium"),
         "task": task.strip(),
     }
+    if no is not None:
+        entry["no"] = int(no)
     _, context_path = sync_workspace_memory(cwd, new_task_entry=entry)
     return context_path
 

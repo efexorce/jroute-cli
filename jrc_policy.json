@@ -58,6 +58,34 @@
       "allow_tools": [
         "claude"
       ]
+    },
+    "keabilgisayar_seo_trend": {
+      "pin": "claude_fable",
+      "effort": "high",
+      "max_effort": "high",
+      "allow_tools": [
+        "claude"
+      ]
+    },
+    "gezegenradyo_suzgec": {
+      "pin": "claude_haiku",
+      "effort": "low",
+      "max_effort": "low"
+    },
+    "eretnabot": {
+      "pin": "agy_argon",
+      "effort": "medium",
+      "max_effort": "high"
+    },
+    "eretna_ajan": {
+      "pin": "agy_argon",
+      "effort": "medium",
+      "max_effort": "high"
+    },
+    "eretna_satis": {
+      "pin": "agy_argon",
+      "effort": "medium",
+      "max_effort": "high"
     }
   },
   "director": {

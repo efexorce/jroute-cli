@@ -537,6 +537,8 @@ def run_interactive_console(args: argparse.Namespace, extra_args: list[str]) -> 
         if not text:
             continue
 
+        # Hız: yönetici (Opus) iş emrini jev kararını beklemeden, analizle paralel yazmaya başlar.
+        prefetch = None if (args.json or one_shot_dry) else jrc_director.start_prefetch(text, target_cwd)
         try:
             with Spinner("Jev görev analizi yapılıyor...", enabled=not args.json):
                 decision = router.analyze_task_with_jev(
@@ -546,11 +548,16 @@ def run_interactive_console(args: argparse.Namespace, extra_args: list[str]) -> 
                     forced_tool=one_shot_tool,
                 )
         except KeyboardInterrupt:
+            if prefetch:
+                prefetch.cancel()
             print("\n\033[2mİşlem iptal edildi.\033[0m\n")
             continue
         except Exception as exc:
+            if prefetch:
+                prefetch.cancel()
             print(f"\033[31m✗ Jev analiz hatası:\033[0m {exc}", file=sys.stderr)
             continue
+        prefetch = jrc_director.resolve_prefetch(prefetch, decision)
 
         cmd = router.build_cli_command(
             decision=decision,
@@ -571,6 +578,9 @@ def run_interactive_console(args: argparse.Namespace, extra_args: list[str]) -> 
         print_console_banner(decision, cmd, cwd=target_cwd)
 
         if one_shot_dry:
+            emir_ctx = jrc_context.build_emir_context_block(text)
+            if emir_ctx:
+                print(f"\n\033[2m{emir_ctx}\033[0m", file=sys.stderr)
             print()
             continue
 
@@ -585,7 +595,8 @@ def run_interactive_console(args: argparse.Namespace, extra_args: list[str]) -> 
 
         # jrc motoru/modeli seçti; işin nasıl yapılacağını ve hafıza notunu yönetici (Opus) yönetir.
         def run_agent(_text: str = text, _decision: dict[str, Any] = decision,
-                      _print: bool = one_shot_print, _cmd: list[str] = cmd) -> None:
+                      _print: bool = one_shot_print, _cmd: list[str] = cmd,
+                      _prefetch: Any = prefetch) -> None:
             if not jrc_director.active_for(_decision):
                 subprocess.run(_cmd, cwd=str(target_cwd))
                 return
@@ -595,6 +606,7 @@ def run_interactive_console(args: argparse.Namespace, extra_args: list[str]) -> 
                     decision=_decision, task=_text, print_mode=_print,
                     skip_permissions=skip_permissions, extra_args=extra_args, brief=brief,
                 ),
+                prefetch=_prefetch,
             )
 
         if one_shot_print:
